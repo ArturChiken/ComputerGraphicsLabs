@@ -11,6 +11,7 @@
 #include "Material.h"
 #include "Submesh.h"
 #include "CullingScene.h"
+#include "ParticleSystem.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -64,6 +65,8 @@ struct SceneRenderContext
     UINT DebugViewMode = 1;
     CullingMode Culling = CullingMode::Octree;
     bool ShowCullingScene = true;
+    ParticleSettings Particles;
+    float DeltaTime = 0.0f;
 };
 
 class GBuffer
@@ -109,6 +112,9 @@ class RenderingSystem
 {
 public:
     const CullingStats& GetCullingStats() const { return mCullingScene.Stats; }
+    UINT GetParticleCount() const { return mParticles.AliveCount(); }
+    void ResetParticles() { mParticles.RequestReset(); }
+    void OnFrameComplete() { mParticles.ReadCompletedCount(); }
     size_t GetOctreeNodeCount() const { return mCullingScene.NodeCount(); }
     size_t GetSceneObjectCount() const { return mCullingScene.Objects.size(); }
     bool Initialize(
@@ -127,6 +133,7 @@ public:
 
 private:
     CullingScene mCullingScene;
+    ParticleSystem mParticles;
     std::unique_ptr<UploadBuffer<InstanceData>> mInstanceBuffer;
     UINT mInstanceCapacity = 0;
     ComPtr<ID3DBlob> mInstanceVs;

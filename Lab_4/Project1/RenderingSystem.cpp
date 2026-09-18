@@ -266,6 +266,8 @@ bool RenderingSystem::Initialize(
     StartupLog("RenderingSystem BuildFrameConstants begin");
     BuildFrameConstants();
     StartupLog("RenderingSystem BuildFrameConstants ok");
+    mParticles.Initialize(device);
+    StartupLog("RenderingSystem GPU particles initialized");
 
     return true;
 }
@@ -277,6 +279,7 @@ void RenderingSystem::Render(
     const SceneRenderContext& scene)
 {
     UpdateFrameConstants(scene);
+    mParticles.Simulate(commandList, scene.DeltaTime, scene.Particles, scene.View, scene.Proj);
 
     mGBuffer.TransitionToGeometryPass(commandList);
     mGBuffer.ClearGeometryTargets(commandList);
@@ -339,6 +342,9 @@ void RenderingSystem::Render(
         RenderInstances(commandList, scene);
     else
         mCullingScene.Stats = {};
+
+    if (scene.Particles.Visible)
+        mParticles.Draw(commandList);
 
     mGBuffer.TransitionToLightingPass(commandList);
     mGBuffer.TransitionLightingToRenderTarget(commandList);

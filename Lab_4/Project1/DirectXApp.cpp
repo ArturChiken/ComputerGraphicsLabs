@@ -1258,6 +1258,18 @@ void DirectXApp::OnResize() {
 // Обработка клавиатуры
 void DirectXApp::OnKeyDown(WPARAM wParam)
 {
+    const WPARAM particleKeys[] = { VK_F8, VK_F9, 'E', 'R', VK_OEM_4, VK_OEM_6 };
+    for (UINT i = 0; i < _countof(particleKeys); ++i)
+    {
+        if (wParam != particleKeys[i] || mParticleKeysDown[i]) continue;
+        mParticleKeysDown[i] = true;
+        if (i == 0) mParticleSettings.Visible = !mParticleSettings.Visible;
+        if (i == 1) mParticleSettings.Paused = !mParticleSettings.Paused;
+        if (i == 2) mParticleSettings.Emit = !mParticleSettings.Emit;
+        if (i == 3 && mRenderingSystem) mRenderingSystem->ResetParticles();
+        if (i == 4) mParticleSettings.EmissionRate = (std::max)(100.0f, mParticleSettings.EmissionRate / 1.5f);
+        if (i == 5) mParticleSettings.EmissionRate = (std::min)(30000.0f, mParticleSettings.EmissionRate * 1.5f);
+    }
     if (wParam == VK_F4) mCullingMode = CullingMode::None;
     if (wParam == VK_F5) mCullingMode = CullingMode::Linear;
     if (wParam == VK_F6) mCullingMode = CullingMode::Octree;
@@ -1305,6 +1317,9 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
 
 void DirectXApp::OnKeyUp(WPARAM wParam)
 {
+    const WPARAM particleKeys[] = { VK_F8, VK_F9, 'E', 'R', VK_OEM_4, VK_OEM_6 };
+    for (UINT i = 0; i < _countof(particleKeys); ++i)
+        if (wParam == particleKeys[i]) mParticleKeysDown[i] = false;
     if (wParam == VK_F7) mF7KeyDown = false;
     if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) {
         UpdateUvDirectionFromInput();
@@ -1353,6 +1368,19 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
+        if (!mShowCullingScene && mParticleSettings.Visible && mRenderingSystem)
+        {
+            std::wostringstream title;
+            title << L"HW5 GPU particles " << mRenderingSystem->GetParticleCount() << L"/" << ParticleSystem::Capacity
+                << L" | Emit " << static_cast<int>(mParticleSettings.EmissionRate) << L"/s"
+                << (mParticleSettings.Emit ? L" ON" : L" OFF")
+                << (mParticleSettings.Paused ? L" | PAUSED" : L" | RUNNING")
+                << L" | " << static_cast<int>(fps) << L" FPS | Speed " << std::fixed << std::setprecision(2) << mCameraSpeed;
+            SetWindowText(window.GetHandle(), title.str().c_str());
+            mFrameCount = 0;
+            mTimeElapsed += 1.0f;
+            return;
+        }
         if (mShowCullingScene && mRenderingSystem)
         {
             const auto& stats = mRenderingSystem->GetCullingStats();
@@ -1698,6 +1726,8 @@ void DirectXApp::Draw(const Timer& gt)
     scene.DebugViewMode = static_cast<UINT>(mDebugViewMode);
     scene.Culling = mCullingMode;
     scene.ShowCullingScene = mShowCullingScene;
+    scene.Particles = mParticleSettings;
+    scene.DeltaTime = gt.DeltaTime();
 
     mRenderingSystem->Render(
         mCommandList.Get(),
@@ -1721,6 +1751,7 @@ void DirectXApp::Draw(const Timer& gt)
     mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
 
     FlushCommandQueue();
+    mRenderingSystem->OnFrameComplete();
 }
 
 void DirectXApp::CreateTextureFromFile(

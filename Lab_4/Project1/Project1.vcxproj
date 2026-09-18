@@ -101,6 +101,7 @@
     <ClInclude Include="ObjectConstants.h" />
     <ClInclude Include="Parser.h" />
     <ClInclude Include="RenderingSystem.h" />
+    <ClInclude Include="ParticleSystem.h" />
     <ClInclude Include="TgaLoader.h" />
     <ClInclude Include="ThrowIfFailed.h" />
     <ClInclude Include="Timer.h" />
@@ -118,6 +119,7 @@
     <ClCompile Include="ObjectConstants.cpp" />
     <ClCompile Include="Parser.cpp" />
     <ClCompile Include="RenderingSystem.cpp" />
+    <ClCompile Include="ParticleSystem.cpp" />
     <ClCompile Include="TgaLoader.cpp" />
     <ClCompile Include="ThrowIfFailed.cpp" />
     <ClCompile Include="Timer.cpp" />
@@ -132,6 +134,7 @@
       <DeploymentContent Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">false</DeploymentContent>
     </None>
     <None Include="sponza.mtl" />
+    <None Include="particles.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

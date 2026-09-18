@@ -18,6 +18,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ParticleSystem.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="main.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -62,6 +65,9 @@
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ParticleSystem.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -103,6 +109,9 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <None Include="particles.hlsl">
+      <Filter>Shaders</Filter>
+    </None>
     <None Include="shaders.hlsl" />
     <None Include="sponza.mtl" />
   </ItemGroup>

@@ -42,30 +42,9 @@ public:
     std::vector<InstanceData> Instances;
     std::vector<DirectX::BoundingBox> Bounds;
     std::vector<unsigned> VisibleIds;
-    CullingStats Stats;
-
-    void Build()
-    {
-        Objects.clear();
-        VisibleIds.reserve(ObjectCount);
-        // A deterministic 16^3 grid keeps comparisons between modes reproducible.
-        for (unsigned y = 0; y < 16; ++y)
-            for (unsigned z = 0; z < 16; ++z)
-                for (unsigned x = 0; x < 16; ++x)
-                {
-                    const float radius = 0.6f + 0.15f * ((x + 3 * y + 7 * z) % 5);
-                    DirectX::XMFLOAT3 center((x - 7.5f) * 8.0f,
-                        (y - 7.5f) * 5.0f, (z - 7.5f) * 8.0f);
-                    SceneObject object;
-                    object.Position = center;
-                    object.Scale = { radius, radius, radius };
-                    object.Rotation.y = 0.25f * ((x + 3 * y + 7 * z) % 24);
-                    Objects.push_back(object);
-                }
-        Rebuild();
     }
 
-    // Call after changing object transforms or adding/removing static objects.
+    
     void Rebuild()
     {
         using namespace DirectX;

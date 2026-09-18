@@ -201,8 +201,10 @@ private:
     bool mF2KeyDown = false;
     bool mF3KeyDown = false;
     CullingMode mCullingMode = CullingMode::Octree;
-    bool mShowCullingScene = true;
+    bool mShowCullingScene = false;
     bool mF7KeyDown = false;
+    ParticleSettings mParticleSettings;
+    bool mParticleKeysDown[6] = {};
 
     // Математика для камеры
     float mTheta = 1.5f * XM_PI;
