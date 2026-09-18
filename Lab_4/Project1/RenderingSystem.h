@@ -10,6 +10,7 @@
 #include "UploadBuffer.h"
 #include "Material.h"
 #include "Submesh.h"
+#include "CullingScene.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -61,6 +62,8 @@ struct SceneRenderContext
     const std::vector<DynamicPointLight>* DynamicPointLights = nullptr;
     bool Wireframe = false;
     UINT DebugViewMode = 1;
+    CullingMode Culling = CullingMode::Octree;
+    bool ShowCullingScene = true;
 };
 
 class GBuffer
@@ -105,6 +108,9 @@ private:
 class RenderingSystem
 {
 public:
+    const CullingStats& GetCullingStats() const { return mCullingScene.Stats; }
+    size_t GetOctreeNodeCount() const { return mCullingScene.NodeCount(); }
+    size_t GetSceneObjectCount() const { return mCullingScene.Objects.size(); }
     bool Initialize(
         ID3D12Device* device,
         UINT width,
@@ -120,6 +126,13 @@ public:
         const SceneRenderContext& scene);
 
 private:
+    CullingScene mCullingScene;
+    std::unique_ptr<UploadBuffer<InstanceData>> mInstanceBuffer;
+    UINT mInstanceCapacity = 0;
+    ComPtr<ID3DBlob> mInstanceVs;
+    ComPtr<ID3D12PipelineState> mInstancePso;
+    ComPtr<ID3D12PipelineState> mInstanceWireframePso;
+    void RenderInstances(ID3D12GraphicsCommandList* commandList, const SceneRenderContext& scene);
     static constexpr UINT MaxDirectionalLights = 1;
     static constexpr UINT MaxSpotLights = 2;
     static constexpr UINT MaxPointLightVolumes = 512;
@@ -167,6 +180,13 @@ private:
     void BuildFrameConstants();
     void BuildShaders();
     void BuildPointLightVolumeMesh();
+    struct SphereVertex
+    {
+        DirectX::XMFLOAT3 Position;
+        DirectX::XMFLOAT2 UV;
+        DirectX::XMFLOAT3 Tangent;
+        DirectX::XMFLOAT3 Bitangent;
+    };
     void UpdateFrameConstants(const SceneRenderContext& scene);
     void RenderPointLightVolume(
         ID3D12GraphicsCommandList* commandList,

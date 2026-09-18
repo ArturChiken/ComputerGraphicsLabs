@@ -247,6 +247,9 @@ bool RenderingSystem::Initialize(
     StartupLog("RenderingSystem GBuffer Initialize ok");
     StartupLog("RenderingSystem BuildPointLightVolumeMesh begin");
     BuildPointLightVolumeMesh();
+    mCullingScene.Build();
+    mInstanceCapacity = static_cast<UINT>(mCullingScene.Instances.size());
+    mInstanceBuffer = std::make_unique<UploadBuffer<InstanceData>>(device, mInstanceCapacity, false);
     StartupLog("RenderingSystem BuildPointLightVolumeMesh ok");
     StartupLog("RenderingSystem BuildShaders begin");
     BuildShaders();
@@ -332,6 +335,11 @@ void RenderingSystem::Render(
         commandList->DrawIndexedInstanced(submesh.IndexCount, 1, submesh.IndexStart, 0, 0);
     }
 
+    if (scene.ShowCullingScene)
+        RenderInstances(commandList, scene);
+    else
+        mCullingScene.Stats = {};
+
     mGBuffer.TransitionToLightingPass(commandList);
     mGBuffer.TransitionLightingToRenderTarget(commandList);
     mGBuffer.ClearLightingTarget(commandList);
@@ -396,6 +404,38 @@ void RenderingSystem::Render(
     lightingSrvHandle.ptr += 3 * mCbvSrvUavDescriptorSize;
     commandList->SetGraphicsRootDescriptorTable(0, lightingSrvHandle);
     commandList->DrawInstanced(3, 1, 0, 0);
+}
+
+void RenderingSystem::RenderInstances(ID3D12GraphicsCommandList* commandList, const SceneRenderContext& scene)
+{
+    BoundingFrustum viewFrustum;
+    BoundingFrustum::CreateFromMatrix(viewFrustum, XMLoadFloat4x4(&scene.Proj));
+    BoundingFrustum worldFrustum;
+    viewFrustum.Transform(worldFrustum, XMMatrixInverse(nullptr, XMLoadFloat4x4(&scene.View)));
+    mCullingScene.Select(worldFrustum, scene.Culling);
+    if (mCullingScene.VisibleIds.empty())
+        return;
+
+    // Draw waits for the GPU at frame end, so this upload buffer can be reused here.
+    if (mCullingScene.VisibleIds.size() > mInstanceCapacity)
+    {
+        mInstanceCapacity = static_cast<UINT>(mCullingScene.VisibleIds.size());
+        mInstanceBuffer = std::make_unique<UploadBuffer<InstanceData>>(mDevice.Get(), mInstanceCapacity, false);
+    }
+    for (size_t i = 0; i < mCullingScene.VisibleIds.size(); ++i)
+        mInstanceBuffer->CopyData(static_cast<int>(i),
+            mCullingScene.Instances[mCullingScene.VisibleIds[i]]);
+    D3D12_VERTEX_BUFFER_VIEW instanceView = {};
+    instanceView.BufferLocation = mInstanceBuffer->Resource()->GetGPUVirtualAddress();
+    instanceView.SizeInBytes = mInstanceCapacity * sizeof(InstanceData);
+    instanceView.StrideInBytes = sizeof(InstanceData);
+    const D3D12_VERTEX_BUFFER_VIEW views[] = { mPointLightVertexBufferView, instanceView };
+    commandList->IASetVertexBuffers(0, 2, views);
+    commandList->IASetIndexBuffer(&mPointLightIndexBufferView);
+    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList->SetPipelineState(scene.Wireframe ? mInstanceWireframePso.Get() : mInstancePso.Get());
+    commandList->DrawIndexedInstanced(mPointLightIndexCount,
+        static_cast<UINT>(mCullingScene.VisibleIds.size()), 0, 0, 0);
 }
 
 void RenderingSystem::BuildLights()
@@ -618,6 +658,28 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
     }
     StartupLog("Create geometry non-tessellated PSO ok");
 
+    const D3D12_INPUT_ELEMENT_DESC instanceLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 20, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "BINORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "INSTANCE", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 0, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTANCE", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 16, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTANCE", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 32, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "INSTANCE", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 48, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "NORMALWORLD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 64, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "NORMALWORLD", 1, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 80, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "NORMALWORLD", 2, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 96, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 },
+        { "NORMALWORLD", 3, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 112, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, 1 }
+    };
+    auto instancePso = geometryNoTessPso;
+    instancePso.InputLayout = { instanceLayout, _countof(instanceLayout) };
+    instancePso.VS = { mInstanceVs->GetBufferPointer(), mInstanceVs->GetBufferSize() };
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&instancePso, IID_PPV_ARGS(&mInstancePso)));
+    instancePso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&instancePso, IID_PPV_ARGS(&mInstanceWireframePso)));
+
     geometryNoTessPso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
     hr = mDevice->CreateGraphicsPipelineState(&geometryNoTessPso, IID_PPV_ARGS(&mGeometryNoTessWireframePso));
     if (FAILED(hr))
@@ -743,6 +805,7 @@ void RenderingSystem::BuildShaders()
 {
     const std::wstring shaderFile = L"../Project1/shaders.hlsl";
     mGeometryVs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryVS", "vs_5_0");
+    mInstanceVs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryInstanceVS", "vs_5_0");
     mGeometryNoTessVs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryNoTessVS", "vs_5_0");
     mGeometryHs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryHS", "hs_5_0");
     mGeometryDs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryDS", "ds_5_0");
@@ -757,62 +820,48 @@ void RenderingSystem::BuildShaders()
 
 void RenderingSystem::BuildPointLightVolumeMesh()
 {
-    constexpr UINT sliceCount = 24;
-    constexpr UINT stackCount = 12;
-    constexpr float pi = 3.1415926535f;
-
-    std::vector<XMFLOAT3> vertices;
+    std::vector<SphereVertex> vertices;
     std::vector<uint32_t> indices;
-
-    vertices.push_back({ 0.0f, 1.0f, 0.0f });
-    for (UINT stack = 1; stack <= stackCount - 1; ++stack)
+    constexpr UINT subdivisions = 12;
+    struct Face { XMFLOAT3 Normal, U, V; XMFLOAT2 Tile; };
+    // Earth_ALB/NORM use a vertical cube-cross atlas, not an equirectangular map.
+    const Face faces[] = {
+        { {0,0,1},  {1,0,0},  {0,-1,0}, {0.375f,0.25f} },
+        { {-1,0,0}, {0,0,1},  {0,-1,0}, {0.125f,0.25f} },
+        { {1,0,0},  {0,0,-1}, {0,-1,0}, {0.625f,0.25f} },
+        { {0,1,0},  {1,0,0},  {0,0,1},  {0.375f,0.0f} },
+        { {0,-1,0}, {1,0,0},  {0,0,-1}, {0.375f,0.5f} },
+        { {0,0,-1}, {1,0,0},  {0,1,0},  {0.375f,0.75f} }
+    };
+    for (const Face& face : faces)
     {
-        float phi = pi * static_cast<float>(stack) / static_cast<float>(stackCount);
-        for (UINT slice = 0; slice <= sliceCount; ++slice)
-        {
-            float theta = 2.0f * pi * static_cast<float>(slice) / static_cast<float>(sliceCount);
-            vertices.push_back({
-                sinf(phi) * cosf(theta),
-                cosf(phi),
-                sinf(phi) * sinf(theta)
-            });
-        }
-    }
-    vertices.push_back({ 0.0f, -1.0f, 0.0f });
-
-    for (UINT slice = 0; slice < sliceCount; ++slice)
-    {
-        indices.push_back(0);
-        indices.push_back(slice + 1);
-        indices.push_back(slice + 2);
-    }
-
-    UINT baseIndex = 1;
-    UINT ringVertexCount = sliceCount + 1;
-    for (UINT stack = 0; stack < stackCount - 2; ++stack)
-    {
-        for (UINT slice = 0; slice < sliceCount; ++slice)
-        {
-            indices.push_back(baseIndex + stack * ringVertexCount + slice);
-            indices.push_back(baseIndex + stack * ringVertexCount + slice + 1);
-            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice);
-
-            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice);
-            indices.push_back(baseIndex + stack * ringVertexCount + slice + 1);
-            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice + 1);
-        }
-    }
-
-    UINT southPoleIndex = static_cast<UINT>(vertices.size() - 1);
-    baseIndex = southPoleIndex - ringVertexCount;
-    for (UINT slice = 0; slice < sliceCount; ++slice)
-    {
-        indices.push_back(southPoleIndex);
-        indices.push_back(baseIndex + slice + 1);
-        indices.push_back(baseIndex + slice);
+        const UINT base = static_cast<UINT>(vertices.size());
+        for (UINT y = 0; y <= subdivisions; ++y)
+            for (UINT x = 0; x <= subdivisions; ++x)
+            {
+                const float u = static_cast<float>(x) / subdivisions;
+                const float v = static_cast<float>(y) / subdivisions;
+                const XMVECTOR normal = XMVector3Normalize(XMLoadFloat3(&face.Normal) +
+                    (2 * u - 1) * XMLoadFloat3(&face.U) + (2 * v - 1) * XMLoadFloat3(&face.V));
+                const XMVECTOR tangent = XMVector3Normalize(XMLoadFloat3(&face.U) -
+                    XMVector3Dot(XMLoadFloat3(&face.U), normal) * normal);
+                SphereVertex vertex;
+                XMStoreFloat3(&vertex.Position, normal);
+                XMStoreFloat3(&vertex.Tangent, tangent);
+                XMStoreFloat3(&vertex.Bitangent, XMVector3Cross(normal, tangent));
+                vertex.UV = { face.Tile.x + u * 0.25f, face.Tile.y + v * 0.25f };
+                vertices.push_back(vertex);
+            }
+        for (UINT y = 0; y < subdivisions; ++y)
+            for (UINT x = 0; x < subdivisions; ++x)
+            {
+                const UINT a = base + y * (subdivisions + 1) + x;
+                const UINT b = a + subdivisions + 1;
+                indices.insert(indices.end(), { a, a + 1, b, b, a + 1, b + 1 });
+            }
     }
 
-    const UINT vertexBufferSize = static_cast<UINT>(vertices.size() * sizeof(XMFLOAT3));
+    const UINT vertexBufferSize = static_cast<UINT>(vertices.size() * sizeof(SphereVertex));
     const UINT indexBufferSize = static_cast<UINT>(indices.size() * sizeof(uint32_t));
 
     D3D12_HEAP_PROPERTIES heapProps = {};
@@ -855,7 +904,7 @@ void RenderingSystem::BuildPointLightVolumeMesh()
     mPointLightIndexBuffer->Unmap(0, nullptr);
 
     mPointLightVertexBufferView.BufferLocation = mPointLightVertexBuffer->GetGPUVirtualAddress();
-    mPointLightVertexBufferView.StrideInBytes = sizeof(XMFLOAT3);
+    mPointLightVertexBufferView.StrideInBytes = sizeof(SphereVertex);
     mPointLightVertexBufferView.SizeInBytes = vertexBufferSize;
 
     mPointLightIndexBufferView.BufferLocation = mPointLightIndexBuffer->GetGPUVirtualAddress();

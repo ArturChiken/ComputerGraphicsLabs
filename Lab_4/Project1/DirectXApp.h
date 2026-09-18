@@ -200,6 +200,9 @@ private:
     bool mF1KeyDown = false;
     bool mF2KeyDown = false;
     bool mF3KeyDown = false;
+    CullingMode mCullingMode = CullingMode::Octree;
+    bool mShowCullingScene = true;
+    bool mF7KeyDown = false;
 
     // Математика для камеры
     float mTheta = 1.5f * XM_PI;

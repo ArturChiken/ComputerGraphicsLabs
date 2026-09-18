@@ -119,6 +119,25 @@ GeometryPSInput GeometryNoTessVS(VSInput vin)
     return vout;
 }
 
+GeometryPSInput GeometryInstanceVS(float3 position : POSITION, float2 uv : TEXCOORD,
+    float3 tangent : TANGENT, float3 bitangent : BINORMAL,
+    float4 world0 : INSTANCE0, float4 world1 : INSTANCE1,
+    float4 world2 : INSTANCE2, float4 world3 : INSTANCE3,
+    float4 normal0 : NORMALWORLD0, float4 normal1 : NORMALWORLD1,
+    float4 normal2 : NORMALWORLD2, float4 normal3 : NORMALWORLD3)
+{
+    GeometryPSInput output;
+    float4x4 world = float4x4(world0, world1, world2, world3);
+    float4x4 normalWorld = float4x4(normal0, normal1, normal2, normal3);
+    output.PosH = mul(mul(float4(position, 1.0f), world), mWorldViewProj);
+    output.NormalW = normalize(mul(normalize(position), (float3x3)normalWorld));
+    output.TangentW = normalize(mul(tangent, (float3x3)world));
+    output.BitangentW = normalize(mul(bitangent, (float3x3)world));
+    output.TexC = uv;
+    output.TessFactor = 1.0f;
+    return output;
+}
+
 struct HSConstantData
 {
     float Edges[3] : SV_TessFactor;

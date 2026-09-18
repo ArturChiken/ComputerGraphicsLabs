@@ -91,6 +91,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="d3dUtil.h" />
+    <ClInclude Include="CullingScene.h" />
     <ClInclude Include="DirectXApp.h" />
     <ClInclude Include="InputDevice.h" />
     <ClInclude Include="main.h" />

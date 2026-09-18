@@ -17,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+#include <iomanip>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -1257,6 +1258,14 @@ void DirectXApp::OnResize() {
 // Обработка клавиатуры
 void DirectXApp::OnKeyDown(WPARAM wParam)
 {
+    if (wParam == VK_F4) mCullingMode = CullingMode::None;
+    if (wParam == VK_F5) mCullingMode = CullingMode::Linear;
+    if (wParam == VK_F6) mCullingMode = CullingMode::Octree;
+    if (wParam == VK_F7 && !mF7KeyDown)
+    {
+        mF7KeyDown = true;
+        mShowCullingScene = !mShowCullingScene;
+    }
     // M toggles render mode; SPACE remains reserved for camera movement.
     if (wParam == 'M') {
         mWireframeMode = !mWireframeMode;
@@ -1296,6 +1305,7 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
 
 void DirectXApp::OnKeyUp(WPARAM wParam)
 {
+    if (wParam == VK_F7) mF7KeyDown = false;
     if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) {
         UpdateUvDirectionFromInput();
     }
@@ -1343,6 +1353,21 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
+        if (mShowCullingScene && mRenderingSystem)
+        {
+            const auto& stats = mRenderingSystem->GetCullingStats();
+            const wchar_t* mode = mCullingMode == CullingMode::None ? L"Off" :
+                (mCullingMode == CullingMode::Linear ? L"Linear" : L"Octree");
+            std::wostringstream title;
+            title << L"HW4 " << mode << L" | Drawn " << stats.Visible
+                << L"/" << mRenderingSystem->GetSceneObjectCount() << L" | Tests " << stats.ObjectTests << L"+" << stats.NodeTests
+                << L" | " << std::fixed << std::setprecision(2) << stats.Milliseconds
+                << L" ms | " << static_cast<int>(fps) << L" FPS | Speed " << mCameraSpeed;
+            SetWindowText(window.GetHandle(), title.str().c_str());
+            mFrameCount = 0;
+            mTimeElapsed += 1.0f;
+            return;
+        }
         if (mDebugViewMode == DebugViewMode::Tessellation) {
             windowText += L" - Tessellation Debug";
         }
@@ -1671,6 +1696,8 @@ void DirectXApp::Draw(const Timer& gt)
     scene.DynamicPointLights = &mPlacedLights;
     scene.Wireframe = mWireframeMode || mDebugViewMode == DebugViewMode::Tessellation;
     scene.DebugViewMode = static_cast<UINT>(mDebugViewMode);
+    scene.Culling = mCullingMode;
+    scene.ShowCullingScene = mShowCullingScene;
 
     mRenderingSystem->Render(
         mCommandList.Get(),
