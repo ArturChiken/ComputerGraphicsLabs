@@ -8,8 +8,138 @@
 #include <algorithm>
 #include <unordered_map>
 #include <sstream>
+#include <cmath>
 
 using namespace DirectX;
+
+namespace
+{
+    struct ObjVertexRef
+    {
+        int Position = 0;
+        int Texcoord = 0;
+        int Normal = 0;
+    };
+
+    ObjVertexRef ParseObjVertexRef(const std::string& token)
+    {
+        ObjVertexRef ref;
+        size_t firstSlash = token.find('/');
+        if (firstSlash == std::string::npos)
+        {
+            ref.Position = std::stoi(token);
+            return ref;
+        }
+
+        ref.Position = std::stoi(token.substr(0, firstSlash));
+        size_t secondSlash = token.find('/', firstSlash + 1);
+        if (secondSlash == std::string::npos)
+        {
+            std::string tex = token.substr(firstSlash + 1);
+            if (!tex.empty())
+                ref.Texcoord = std::stoi(tex);
+            return ref;
+        }
+
+        std::string tex = token.substr(firstSlash + 1, secondSlash - firstSlash - 1);
+        std::string norm = token.substr(secondSlash + 1);
+        if (!tex.empty())
+            ref.Texcoord = std::stoi(tex);
+        if (!norm.empty())
+            ref.Normal = std::stoi(norm);
+        return ref;
+    }
+
+    XMFLOAT3 NormalizeFloat3(const XMFLOAT3& v, const XMFLOAT3& fallback)
+    {
+        XMVECTOR vec = XMLoadFloat3(&v);
+        float lenSq = XMVectorGetX(XMVector3LengthSq(vec));
+        if (lenSq <= 1e-10f)
+            return fallback;
+
+        XMFLOAT3 result;
+        XMStoreFloat3(&result, XMVector3Normalize(vec));
+        return result;
+    }
+
+    void GenerateNormalsTangents(std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices)
+    {
+        for (size_t i = 0; i + 2 < indices.size(); i += 3)
+        {
+            Vertex& v0 = vertices[indices[i + 0]];
+            Vertex& v1 = vertices[indices[i + 1]];
+            Vertex& v2 = vertices[indices[i + 2]];
+
+            XMVECTOR p0 = XMLoadFloat3(&v0.position);
+            XMVECTOR p1 = XMLoadFloat3(&v1.position);
+            XMVECTOR p2 = XMLoadFloat3(&v2.position);
+            XMVECTOR edge1 = p1 - p0;
+            XMVECTOR edge2 = p2 - p0;
+
+            XMVECTOR normalVec = XMVector3Normalize(XMVector3Cross(edge1, edge2));
+            XMFLOAT3 faceNormal;
+            XMStoreFloat3(&faceNormal, normalVec);
+
+            XMFLOAT2 deltaUV1 =
+            {
+                v1.texcoord.x - v0.texcoord.x,
+                v1.texcoord.y - v0.texcoord.y
+            };
+            XMFLOAT2 deltaUV2 =
+            {
+                v2.texcoord.x - v0.texcoord.x,
+                v2.texcoord.y - v0.texcoord.y
+            };
+
+            float det = deltaUV1.x * deltaUV2.y - deltaUV2.x * deltaUV1.y;
+            XMFLOAT3 tangent = { 1.0f, 0.0f, 0.0f };
+            XMFLOAT3 bitangent = { 0.0f, 1.0f, 0.0f };
+
+            if (std::fabs(det) > 1e-8f)
+            {
+                float f = 1.0f / det;
+                XMFLOAT3 e1;
+                XMFLOAT3 e2;
+                XMStoreFloat3(&e1, edge1);
+                XMStoreFloat3(&e2, edge2);
+
+                tangent =
+                {
+                    f * (deltaUV2.y * e1.x - deltaUV1.y * e2.x),
+                    f * (deltaUV2.y * e1.y - deltaUV1.y * e2.y),
+                    f * (deltaUV2.y * e1.z - deltaUV1.y * e2.z)
+                };
+
+                bitangent =
+                {
+                    f * (-deltaUV2.x * e1.x + deltaUV1.x * e2.x),
+                    f * (-deltaUV2.x * e1.y + deltaUV1.x * e2.y),
+                    f * (-deltaUV2.x * e1.z + deltaUV1.x * e2.z)
+                };
+            }
+
+            Vertex* tri[3] = { &v0, &v1, &v2 };
+            for (Vertex* v : tri)
+            {
+                XMFLOAT3 normal = NormalizeFloat3(v->normal, faceNormal);
+                XMVECTOR nVec = XMLoadFloat3(&normal);
+                XMVECTOR tVec = XMLoadFloat3(&tangent);
+                tVec = XMVector3Normalize(tVec - XMVector3Dot(tVec, nVec) * nVec);
+                XMVECTOR bVec = XMVector3Normalize(XMVector3Cross(nVec, tVec));
+
+                v->normal = normal;
+                XMStoreFloat3(&v->tangent, tVec);
+                XMStoreFloat3(&v->bitangent, bVec);
+            }
+        }
+    }
+
+    std::string TrimLeft(const std::string& line)
+    {
+        size_t first = line.find_first_not_of(" \t\r\n");
+        return first == std::string::npos ? std::string{} : line.substr(first);
+    }
+}
 
 bool LoadOBJ(
     const std::string& filename,
@@ -65,7 +195,7 @@ bool LoadOBJ(
 
         else if (line.rfind("usemtl ", 0) == 0)
         {
-            // åñëè óæå áûë ìàòåðèàë — çàêðûâàåì ïðåäûäóùèé submesh
+            // ÐµÑÐ»Ð¸ ÑƒÐ¶Ðµ Ð±Ñ‹Ð» Ð¼Ð°Ñ‚ÐµÑ€Ð¸Ð°Ð» â€” Ð·Ð°ÐºÑ€Ñ‹Ð²Ð°ÐµÐ¼ Ð¿Ñ€ÐµÐ´Ñ‹Ð´ÑƒÑ‰Ð¸Ð¹ submesh
             if (!currentMaterial.empty() &&
                 outIndices.size() > currentStartIndex)
             {
@@ -82,23 +212,18 @@ bool LoadOBJ(
 
         else if (line.rfind("f ", 0) == 0)
         {
-            std::vector<int> pi, ti, ni;
+            std::vector<ObjVertexRef> refs;
 
             std::stringstream ss(line.substr(2));
             std::string vert;
 
             while (ss >> vert)
             {
-                int p = 0, t = 0, n = 0;
-                sscanf_s(vert.c_str(), "%d/%d/%d", &p, &t, &n);
-
-                pi.push_back(p);
-                ti.push_back(t);
-                ni.push_back(n);
+                refs.push_back(ParseObjVertexRef(vert));
             }
 
-            // Òðèàíãóëÿöèÿ fan ñïîñîáîì
-            for (size_t i = 1; i + 1 < pi.size(); ++i)
+            // Ð¢Ñ€Ð¸Ð°Ð½Ð³ÑƒÐ»ÑÑ†Ð¸Ñ fan ÑÐ¿Ð¾ÑÐ¾Ð±Ð¾Ð¼
+            for (size_t i = 1; i + 1 < refs.size(); ++i)
             {
                 int ids[3] = { 0, (int)i, (int)i + 1 };
 
@@ -106,13 +231,18 @@ bool LoadOBJ(
                 {
                     Vertex v{};
 
-                    int posIndex = pi[ids[k]] - 1;
-                    int texIndex = ti[ids[k]] - 1;
-                    int normIndex = ni[ids[k]] - 1;
+                    const ObjVertexRef& ref = refs[ids[k]];
+                    int posIndex = ref.Position - 1;
+                    int texIndex = ref.Texcoord - 1;
+                    int normIndex = ref.Normal - 1;
 
                     v.position = positions[posIndex];
-                    v.normal = normals[normIndex];
-                    v.texcoord = texcoords[texIndex];
+                    v.normal = (normIndex >= 0 && normIndex < static_cast<int>(normals.size()))
+                        ? normals[normIndex]
+                        : XMFLOAT3{ 0.0f, 0.0f, 0.0f };
+                    v.texcoord = (texIndex >= 0 && texIndex < static_cast<int>(texcoords.size()))
+                        ? texcoords[texIndex]
+                        : XMFLOAT2{ 0.0f, 0.0f };
 
                     outVertices.push_back(v);
                     outIndices.push_back((uint32_t)outVertices.size() - 1);
@@ -123,6 +253,8 @@ bool LoadOBJ(
 
     if (outVertices.empty())
         return false;
+
+    GenerateNormalsTangents(outVertices, outIndices);
 
     // ==============================
     //        CENTER MODEL
@@ -182,6 +314,7 @@ bool LoadMTL(
 
     while (std::getline(file, line))
     {
+        line = TrimLeft(line);
         if (line.rfind("newmtl ", 0) == 0)
         {
             if (!current.Name.empty())
@@ -193,6 +326,28 @@ bool LoadMTL(
         else if (line.rfind("map_Kd ", 0) == 0)
         {
             current.DiffuseMap = line.substr(7);
+        }
+        else if (line.rfind("map_bump ", 0) == 0)
+        {
+            // Bump maps perturb normals; they are not reliable geometric displacement maps.
+            if (current.NormalMap.empty())
+                current.NormalMap = line.substr(9);
+        }
+        else if (line.rfind("bump ", 0) == 0)
+        {
+            // Keep bump as a normal-map fallback, but reserve displacement for disp/map_disp.
+            if (current.NormalMap.empty())
+                current.NormalMap = line.substr(5);
+        }
+        else if (line.rfind("norm ", 0) == 0 || line.rfind("map_norm ", 0) == 0)
+        {
+            size_t space = line.find(' ');
+            current.NormalMap = line.substr(space + 1);
+        }
+        else if (line.rfind("disp ", 0) == 0 || line.rfind("map_disp ", 0) == 0)
+        {
+            size_t space = line.find(' ');
+            current.DisplacementMap = line.substr(space + 1);
         }
         else if (line.rfind("Kd ", 0) == 0)
         {

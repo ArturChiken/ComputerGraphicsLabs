@@ -15,7 +15,9 @@ struct ParsedMaterial
 {
     std::string Name;
     std::string DiffuseMap; // map_Kd
-    DirectX::XMFLOAT3 Kd = { 1.0f, 1.0f, 1.0f }; // цвет по умолчанию
+    std::string NormalMap; // norm / map_norm; falls back to bump when no normal map exists
+    std::string DisplacementMap; // only true disp / map_disp height sources for tessellation
+    DirectX::XMFLOAT3 Kd = { 1.0f, 1.0f, 1.0f }; // С†РІРµС‚ РїРѕ СѓРјРѕР»С‡Р°РЅРёСЋ
 };
 
 bool LoadMTL(

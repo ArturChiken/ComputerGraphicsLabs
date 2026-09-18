@@ -1,0 +1,4 @@
+newmtl Earth
+map_Kd Earth_ALB.bmp
+norm Earth_NORM.bmp
+disp Earth_HEIGHT.bmp

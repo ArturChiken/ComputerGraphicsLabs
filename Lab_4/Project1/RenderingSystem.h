@@ -29,6 +29,12 @@ struct PointLight
     float Intensity = 4.0f;
 };
 
+struct DynamicPointLight
+{
+    PointLight Light;
+    float Age = 0.0f;
+};
+
 struct SpotLight
 {
     DirectX::XMFLOAT3 Position = { 0.0f, 4.0f, -4.0f };
@@ -52,7 +58,9 @@ struct SceneRenderContext
     DirectX::XMFLOAT4X4 Proj = {};
     DirectX::XMFLOAT3 EyePos = { 0.0f, 0.0f, 0.0f };
     DirectX::XMFLOAT2 UvOffset = { 0.0f, 0.0f };
+    const std::vector<DynamicPointLight>* DynamicPointLights = nullptr;
     bool Wireframe = false;
+    UINT DebugViewMode = 1;
 };
 
 class GBuffer
@@ -64,7 +72,8 @@ public:
         UINT height,
         UINT rtvDescriptorSize);
 
-    void Clear(ID3D12GraphicsCommandList* commandList) const;
+    void ClearGeometryTargets(ID3D12GraphicsCommandList* commandList) const;
+    void ClearLightingTarget(ID3D12GraphicsCommandList* commandList) const;
     void BindForGeometryPass(ID3D12GraphicsCommandList* commandList) const;
     void TransitionToGeometryPass(ID3D12GraphicsCommandList* commandList) const;
     void TransitionToLightingPass(ID3D12GraphicsCommandList* commandList) const;
@@ -112,8 +121,8 @@ public:
 
 private:
     static constexpr UINT MaxDirectionalLights = 1;
-    static constexpr UINT MaxPointLights = 4;
     static constexpr UINT MaxSpotLights = 2;
+    static constexpr UINT MaxPointLightVolumes = 512;
 
     struct DirectionalLightGpu
     {
@@ -137,11 +146,18 @@ private:
     struct FrameConstants
     {
         DirectX::XMFLOAT4X4 InvViewProj;
+        DirectX::XMFLOAT4X4 ViewProj;
         DirectX::XMFLOAT4 CameraPosition;
         DirectX::XMFLOAT4 LightCounts;
+        DirectX::XMFLOAT4 ScreenSize;
         DirectionalLightGpu DirectionalLights[MaxDirectionalLights];
-        PointLightGpu PointLights[MaxPointLights];
         SpotLightGpu SpotLights[MaxSpotLights];
+    };
+
+    struct PointLightVolumeConstants
+    {
+        DirectX::XMFLOAT4 PositionRange;
+        DirectX::XMFLOAT4 ColorIntensity;
     };
 
     void BuildLights();
@@ -150,31 +166,54 @@ private:
     void BuildDeferredDescriptorHeap();
     void BuildFrameConstants();
     void BuildShaders();
+    void BuildPointLightVolumeMesh();
     void UpdateFrameConstants(const SceneRenderContext& scene);
+    void RenderPointLightVolume(
+        ID3D12GraphicsCommandList* commandList,
+        const PointLight& light,
+        UINT lightIndex);
     Material* FindMaterial(const SceneRenderContext& scene, const std::string& materialName) const;
 
     ComPtr<ID3D12Device> mDevice;
     UINT mCbvSrvUavDescriptorSize = 0;
+    UINT mWidth = 1;
+    UINT mHeight = 1;
     GBuffer mGBuffer;
 
     ComPtr<ID3D12RootSignature> mGeometryRootSignature;
     ComPtr<ID3D12RootSignature> mLightingRootSignature;
+    ComPtr<ID3D12RootSignature> mPointLightRootSignature;
     ComPtr<ID3D12RootSignature> mFinalRootSignature;
 
     ComPtr<ID3D12PipelineState> mGeometryPso;
     ComPtr<ID3D12PipelineState> mGeometryWireframePso;
+    ComPtr<ID3D12PipelineState> mGeometryNoTessPso;
+    ComPtr<ID3D12PipelineState> mGeometryNoTessWireframePso;
     ComPtr<ID3D12PipelineState> mLightingPso;
+    ComPtr<ID3D12PipelineState> mPointLightPso;
     ComPtr<ID3D12PipelineState> mFinalPso;
 
     ComPtr<ID3DBlob> mGeometryVs;
+    ComPtr<ID3DBlob> mGeometryNoTessVs;
+    ComPtr<ID3DBlob> mGeometryHs;
+    ComPtr<ID3DBlob> mGeometryDs;
     ComPtr<ID3DBlob> mGeometryPs;
     ComPtr<ID3DBlob> mLightingVs;
     ComPtr<ID3DBlob> mLightingPs;
+    ComPtr<ID3DBlob> mPointLightVs;
+    ComPtr<ID3DBlob> mPointLightPs;
     ComPtr<ID3DBlob> mFinalVs;
     ComPtr<ID3DBlob> mFinalPs;
 
     ComPtr<ID3D12DescriptorHeap> mDeferredHeap;
     std::unique_ptr<UploadBuffer<FrameConstants>> mFrameConstants;
+    std::unique_ptr<UploadBuffer<PointLightVolumeConstants>> mPointLightConstants;
+
+    ComPtr<ID3D12Resource> mPointLightVertexBuffer;
+    ComPtr<ID3D12Resource> mPointLightIndexBuffer;
+    D3D12_VERTEX_BUFFER_VIEW mPointLightVertexBufferView = {};
+    D3D12_INDEX_BUFFER_VIEW mPointLightIndexBufferView = {};
+    UINT mPointLightIndexCount = 0;
 
     std::vector<DirectionalLight> mDirectionalLights;
     std::vector<PointLight> mPointLights;

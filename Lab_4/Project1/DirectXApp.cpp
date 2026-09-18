@@ -2,18 +2,94 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>
 #include "d3dUtil.h"
 #include <string>
 #include <DirectXMath.h>
 #include "Parser.h"
 #include "ThrowIfFailed.h"
 #include "TgaLoader.h"
+#include "ModelLoader.h"
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <limits>
+#include <sstream>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
+#pragma comment(lib, "windowscodecs.lib")
 
 using namespace DirectX;
+
+namespace
+{
+    std::filesystem::path GetExeDirectory()
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).parent_path();
+    }
+
+    std::string WithTrailingSlash(const std::filesystem::path& path)
+    {
+        std::string result = path.lexically_normal().string();
+        if (!result.empty() && result.back() != '\\' && result.back() != '/')
+            result += "\\";
+        return result;
+    }
+
+    constexpr float TessellationMaxFactor = 8.0f;
+    constexpr float TessellationMinFactor = 1.0f;
+    constexpr float TessellationNearDistance = 0.0f;
+    constexpr float TessellationFarDistance = 0.5f;
+    constexpr float EarthDisplacementScale = 0.06f;
+    constexpr float EarthNormalStrength = 1.0f;
+    constexpr float CameraMinSpeed = 0.1f;
+    constexpr float CameraMaxSpeed = 20.0f;
+
+    std::string ResolveEarthDirectory()
+    {
+        std::filesystem::path cwd = std::filesystem::current_path();
+        std::filesystem::path exeDir = GetExeDirectory();
+        const std::filesystem::path relative = "Assets/Earth";
+
+        std::vector<std::filesystem::path> candidates =
+        {
+            cwd / relative,
+            cwd / "Project1" / relative,
+            cwd / ".." / "Project1" / relative,
+            exeDir / relative,
+            exeDir / ".." / relative,
+            exeDir / ".." / ".." / relative,
+            exeDir / ".." / "Project1" / relative,
+            exeDir / ".." / ".." / "Project1" / relative
+        };
+
+        for (const auto& candidate : candidates)
+        {
+            if (std::filesystem::exists(candidate / "Earth.fbx") &&
+                std::filesystem::exists(candidate / "Earth.mtl"))
+            {
+                return WithTrailingSlash(candidate);
+            }
+        }
+
+        return {};
+    }
+
+    void StartupLog(const std::string& message)
+    {
+        OutputDebugStringA((message + "\n").c_str());
+
+        std::ofstream log(GetExeDirectory() / "Project1_startup.log", std::ios::app);
+        if (log)
+            log << message << '\n';
+    }
+}
 
 // Вспомогательная структура для барьеров
 struct CD3DX12_RESOURCE_BARRIER_HELPER {
@@ -181,6 +257,12 @@ void DirectXApp::BuildInputLayout()
           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
 
         { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32,
+          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+
+        { "BINORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 44,
           D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
 }
@@ -202,7 +284,7 @@ void DirectXApp::BuildShaders()
         "ps_5_0"
     );
 
-    MessageBox(NULL, L"SUCCESS! Shaders compiled", L"Info", MB_OK);
+    OutputDebugStringW(L"Shaders compiled successfully.\n");
 }
 
 // =========== Константный буфер и CBV ===========
@@ -236,7 +318,7 @@ void DirectXApp::BuildConstantBuffer()
     D3D12_CPU_DESCRIPTOR_HANDLE cbvHandle = mCbvHeap->GetCPUDescriptorHandleForHeapStart();
     device->CreateConstantBufferView(&cbvDesc, cbvHandle);
 
-    MessageBox(NULL, L"Constant buffer and CBV created", L"Info", MB_OK);
+    OutputDebugStringW(L"Constant buffer and CBV created.\n");
 }
 
 // =========== Root Signature ===========
@@ -329,7 +411,7 @@ void DirectXApp::BuildPSO()
     // 3. Корневая сигнатура
     psoDesc.pRootSignature = mRootSignature.Get();
 
-    // 4. Растеризатор (используем CD3DX12_RASTERIZER_DESC как на слайде)
+    // 4. Растеризатор 
     D3D12_RASTERIZER_DESC rasterDesc = {};
     rasterDesc.FillMode = D3D12_FILL_MODE_SOLID;
     psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
@@ -338,7 +420,7 @@ void DirectXApp::BuildPSO()
 
     psoDesc.RasterizerState = CD3DX12_RASTERIZER_DESC(D3D12_DEFAULT);
 
-    // 5. Blend State (как на слайде)
+    // 5. Blend State 
     D3D12_BLEND_DESC blendDesc = {};
     blendDesc.AlphaToCoverageEnable = FALSE;
     blendDesc.IndependentBlendEnable = FALSE;
@@ -357,7 +439,7 @@ void DirectXApp::BuildPSO()
 
     psoDesc.BlendState = CD3DX12_BLEND_DESC(D3D12_DEFAULT);
 
-    // 6. Depth/Stencil State (как на слайде)
+    // 6. Depth/Stencil State 
     psoDesc.DepthStencilState = CD3DX12_DEPTH_STENCIL_DESC(D3D12_DEFAULT);
 
     // 7. Sample Mask
@@ -384,7 +466,7 @@ void DirectXApp::BuildPSO()
         return;
     }
 
-    MessageBox(NULL, L"PSO created successfully (Solid Mode)", L"Info", MB_OK);
+    OutputDebugStringW(L"PSO created successfully (Solid Mode).\n");
 }
 
 // =========== Wireframe PSO ===========
@@ -445,27 +527,45 @@ void DirectXApp::BuildWireframePSO()
         return;
     }
 
-    MessageBox(NULL, L"Wireframe PSO created successfully", L"Info", MB_OK);
+    OutputDebugStringW(L"Wireframe PSO created successfully.\n");
 }
 // =========== Остальные методы ===========
-void DirectXApp::BuildObj(const std::string& path)
+void DirectXApp::BuildModel(const std::string& path)
 {
-    MessageBoxA(nullptr, "BuildObj called", "DEBUG", MB_OK);
+    OutputDebugStringA(("Loading model: " + path + "\n").c_str());
 
     // Очистить старые данные
     mSubmeshes.clear();
+    mIndexCount = 0;
+    mSceneVertices.clear();
+    mSceneIndices.clear();
 
     std::vector<Vertex> vertices;
     std::vector<uint32_t> indices;
 
-    // Загружаем OBJ с сабмешами
-    if (!LoadOBJ(path, vertices, indices, mSubmeshes))
+    std::string extension = std::filesystem::path(path).extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+
+    bool loaded = false;
+    std::string loadError;
+    if (extension == ".fbx")
+        loaded = LoadModelWithAssimp(path, vertices, indices, mSubmeshes, loadError);
+    else
+        loaded = LoadOBJ(path, vertices, indices, mSubmeshes);
+
+    if (!loaded)
     {
-        MessageBoxA(nullptr, "Failed to load OBJ", "Error", MB_OK);
+        const std::string message = loadError.empty()
+            ? "Failed to load model: " + path
+            : "Failed to load model: " + path + "\n" + loadError;
+        MessageBoxA(nullptr, message.c_str(), "Error", MB_OK);
         return;
     }
 
     mIndexCount = static_cast<UINT>(indices.size());
+    mSceneVertices = vertices;
+    mSceneIndices = indices;
 
     UINT vbByteSize = static_cast<UINT>(vertices.size() * sizeof(Vertex));
     UINT ibByteSize = static_cast<UINT>(indices.size() * sizeof(uint32_t));
@@ -533,6 +633,97 @@ void DirectXApp::BuildObj(const std::string& path)
     mIndexBufferView.SizeInBytes = ibByteSize;
 }
 
+void DirectXApp::FitCameraToLoadedScene()
+{
+    if (mSceneVertices.empty())
+        return;
+
+    XMFLOAT3 minPoint =
+    {
+        (std::numeric_limits<float>::max)(),
+        (std::numeric_limits<float>::max)(),
+        (std::numeric_limits<float>::max)()
+    };
+    XMFLOAT3 maxPoint =
+    {
+        (std::numeric_limits<float>::lowest)(),
+        (std::numeric_limits<float>::lowest)(),
+        (std::numeric_limits<float>::lowest)()
+    };
+
+    for (const Vertex& vertex : mSceneVertices)
+    {
+        minPoint.x = (std::min)(minPoint.x, vertex.position.x);
+        minPoint.y = (std::min)(minPoint.y, vertex.position.y);
+        minPoint.z = (std::min)(minPoint.z, vertex.position.z);
+
+        maxPoint.x = (std::max)(maxPoint.x, vertex.position.x);
+        maxPoint.y = (std::max)(maxPoint.y, vertex.position.y);
+        maxPoint.z = (std::max)(maxPoint.z, vertex.position.z);
+    }
+
+    const XMFLOAT3 center =
+    {
+        (minPoint.x + maxPoint.x) * 0.5f,
+        (minPoint.y + maxPoint.y) * 0.5f,
+        (minPoint.z + maxPoint.z) * 0.5f
+    };
+    const XMFLOAT3 extent =
+    {
+        maxPoint.x - minPoint.x,
+        maxPoint.y - minPoint.y,
+        maxPoint.z - minPoint.z
+    };
+    mSceneCenter = center;
+    mSceneExtent = extent;
+
+    XMFLOAT3 targetPoint =
+    {
+        center.x,
+        center.y,
+        center.z
+    };
+
+    if (extent.y < 0.25f && extent.x > 1.0f && extent.z > 1.0f)
+    {
+        // Flat material-preview scenes are best viewed from above at an angle.
+        mEyePos =
+        {
+            center.x,
+            center.y + (std::max)(2.0f, (std::max)(extent.x, extent.z) * 0.38f),
+            center.z - (std::max)(2.0f, extent.z * 0.45f)
+        };
+    }
+    else
+    {
+        mEyePos =
+        {
+            center.x,
+            center.y + (std::max)(2.0f, extent.y * 0.45f),
+            center.z - (std::max)(6.0f, extent.z * 2.0f)
+        };
+
+        targetPoint =
+        {
+            center.x,
+            center.y + extent.y * 0.15f,
+            center.z
+        };
+    }
+
+    XMVECTOR eye = XMLoadFloat3(&mEyePos);
+    XMVECTOR target = XMLoadFloat3(&targetPoint);
+    XMVECTOR forward = XMVector3Normalize(target - eye);
+
+    XMFLOAT3 forwardFloat;
+    XMStoreFloat3(&forwardFloat, forward);
+    mYaw = std::atan2(forwardFloat.z, forwardFloat.x);
+    mPitch = std::asin(std::clamp(forwardFloat.y, -1.0f, 1.0f));
+
+    XMMATRIX view = XMMatrixLookAtLH(eye, target, XMVectorSet(0, 1, 0, 0));
+    XMStoreFloat4x4(&mView, view);
+}
+
 void DirectXApp::Shutdown() {
     FlushCommandQueue();
 
@@ -565,6 +756,11 @@ void DirectXApp::Shutdown() {
     device.Reset();
     adapter.Reset();
     dxgiFactory.Reset();
+    if (mComInitialized)
+    {
+        CoUninitialize();
+        mComInitialized = false;
+    }
 }
 
 bool DirectXApp::CreateDXGIFactory() {
@@ -611,7 +807,7 @@ bool DirectXApp::CreateD3DDevice() {
             MessageBox(NULL, L"No hardware adapter found and WARP failed", L"Error", MB_OK);
             return false;
         }
-        MessageBox(NULL, L"Using WARP software adapter", L"Info", MB_OK);
+        OutputDebugStringW(L"Using WARP software adapter.\n");
     }
 
     HRESULT hr = D3D12CreateDevice(
@@ -758,7 +954,7 @@ bool DirectXApp::CreateDescriptorHeaps() {
 
     // 3. CBV/SRV/UAV куча
     D3D12_DESCRIPTOR_HEAP_DESC cbvHeapDesc;
-    cbvHeapDesc.NumDescriptors = 1 + 200; // 1 CBV + 1 SRV
+    cbvHeapDesc.NumDescriptors = 1 + 512;
     cbvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     cbvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     cbvHeapDesc.NodeMask = 0;
@@ -853,6 +1049,11 @@ void DirectXApp::SetViewportAndScissor() {
 }
 
 bool DirectXApp::Initialize() {
+    StartupLog("Initialize begin");
+
+    HRESULT comHr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    mComInitialized = SUCCEEDED(comHr);
+
     #if defined(_DEBUG)
         {
             ComPtr<ID3D12Debug> debugController;
@@ -862,20 +1063,28 @@ bool DirectXApp::Initialize() {
             }
         }
     #endif
-    MessageBox(NULL, L"Starting DirectX 12 initialization...", L"Info", MB_OK);
+    StartupLog("Starting DirectX 12 initialization");
 
     // Основные этапы инициализации
-    if (!CreateDXGIFactory()) return false;
-    if (!CreateD3DDevice()) return false;
-    if (!CreateCommandObjects()) return false;
-    if (!CreateFence()) return false;
-    if (!CreateSwapChain()) return false;
+    if (!CreateDXGIFactory()) { StartupLog("CreateDXGIFactory failed"); return false; }
+    StartupLog("CreateDXGIFactory ok");
+    if (!CreateD3DDevice()) { StartupLog("CreateD3DDevice failed"); return false; }
+    StartupLog("CreateD3DDevice ok");
+    if (!CreateCommandObjects()) { StartupLog("CreateCommandObjects failed"); return false; }
+    StartupLog("CreateCommandObjects ok");
+    if (!CreateFence()) { StartupLog("CreateFence failed"); return false; }
+    StartupLog("CreateFence ok");
+    if (!CreateSwapChain()) { StartupLog("CreateSwapChain failed"); return false; }
+    StartupLog("CreateSwapChain ok");
 
     QueryDescriptorSizes();
 
-    if (!CreateDescriptorHeaps()) return false;
-    if (!CreateRenderTargetViews()) return false;
-    if (!CreateDepthStencilBuffer()) return false;
+    if (!CreateDescriptorHeaps()) { StartupLog("CreateDescriptorHeaps failed"); return false; }
+    StartupLog("CreateDescriptorHeaps ok");
+    if (!CreateRenderTargetViews()) { StartupLog("CreateRenderTargetViews failed"); return false; }
+    StartupLog("CreateRenderTargetViews ok");
+    if (!CreateDepthStencilBuffer()) { StartupLog("CreateDepthStencilBuffer failed"); return false; }
+    StartupLog("CreateDepthStencilBuffer ok");
 
     CreateViewportAndScissor();
 
@@ -883,28 +1092,67 @@ bool DirectXApp::Initialize() {
     BuildInputLayout();
    //BuildVertexBuffer();
    //BuildIndexBuffer();
-    BuildObj("../Project1/sponza.obj");
+    const std::string sceneDir = ResolveEarthDirectory();
+    if (sceneDir.empty())
+    {
+        StartupLog("ResolveEarthDirectory failed");
+        MessageBoxA(nullptr, "Failed to find Assets/Earth/Earth.fbx and Earth.mtl", "Asset path error", MB_OK);
+        return false;
+    }
+    StartupLog("Resolved scene dir: " + sceneDir);
+
+    BuildModel(sceneDir + "Earth.fbx");
+    if (mIndexCount == 0)
+    {
+        StartupLog("BuildModel failed");
+        MessageBoxA(nullptr, ("Failed to load FBX: " + sceneDir + "Earth.fbx").c_str(), "Asset load error", MB_OK);
+        return false;
+    }
+    StartupLog("BuildModel ok");
+    FitCameraToLoadedScene();
+    StartupLog("FitCameraToLoadedScene ok");
+
     std::vector<ParsedMaterial> parsed;
-    LoadMTL("../Project1/sponza.mtl", parsed);
+    if (!LoadMTL(sceneDir + "Earth.mtl", parsed))
+    {
+        StartupLog("LoadMTL failed");
+        MessageBoxA(nullptr, ("Failed to load MTL: " + sceneDir + "Earth.mtl").c_str(), "Asset load error", MB_OK);
+        return false;
+    }
+    StartupLog("LoadMTL ok");
 
     UINT srvIndex = 0;
+    constexpr UINT MaterialTextureCount = 3;
 
     for (auto& p : parsed)
     {
         Material mat;
         mat.Name = p.Name;
-        mat.SrvHeapIndex = srvIndex++;
+        mat.DiffuseMap = p.DiffuseMap;
+        mat.NormalMap = p.NormalMap;
+        mat.DisplacementMap = p.DisplacementMap;
+        mat.DisplacementScale = p.DisplacementMap.empty() ? 0.0f : mat.DisplacementScale;
+        mat.SrvHeapIndex = srvIndex;
+        srvIndex += MaterialTextureCount;
 
         if (!p.DiffuseMap.empty())
         {
-            CreateTextureFromTGA(
-                "../Project1/" + p.DiffuseMap,
-                mat.DiffuseTexture);
+            CreateTextureFromFile(sceneDir + p.DiffuseMap, mat.DiffuseTexture);
         }
         else
         {
             CreateColorTexture(p.Kd, mat.DiffuseTexture);
         }
+
+        if (!p.NormalMap.empty())
+            CreateTextureFromFile(sceneDir + p.NormalMap, mat.NormalTexture);
+        else
+            CreateColorTexture({ 0.5f, 0.5f, 1.0f }, mat.NormalTexture);
+
+        if (!p.DisplacementMap.empty())
+            CreateTextureFromFile(sceneDir + p.DisplacementMap, mat.DisplacementTexture);
+        else
+            CreateColorTexture({ 0.5f, 0.5f, 0.5f }, mat.DisplacementTexture);
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
@@ -919,6 +1167,18 @@ bool DirectXApp::Initialize() {
 
         device->CreateShaderResourceView(
             mat.DiffuseTexture.Get(),
+            &srvDesc,
+            hDescriptor);
+
+        hDescriptor.ptr += mCbvSrvUavDescriptorSize;
+        device->CreateShaderResourceView(
+            mat.NormalTexture.Get(),
+            &srvDesc,
+            hDescriptor);
+
+        hDescriptor.ptr += mCbvSrvUavDescriptorSize;
+        device->CreateShaderResourceView(
+            mat.DisplacementTexture.Get(),
             &srvDesc,
             hDescriptor);
 
@@ -937,10 +1197,26 @@ bool DirectXApp::Initialize() {
         {
             mat.Tiling = { 6.0f, 6.0f }; // тайлинг пола
         }
+
+        if (mat.Name == "Earth")
+        {
+            mat.Tiling = { 1.0f, 1.0f };
+            mat.DisplacementScale = EarthDisplacementScale;
+            mat.NormalStrength = EarthNormalStrength;
+            mat.TessellationParams =
+            {
+                TessellationMaxFactor,
+                TessellationMinFactor,
+                TessellationNearDistance,
+                TessellationFarDistance
+            };
+        }
     }
 
     BuildConstantBuffer();
+    StartupLog("BuildConstantBuffer ok");
     mRenderingSystem = std::make_unique<RenderingSystem>();
+    StartupLog("RenderingSystem Initialize begin");
     mRenderingSystem->Initialize(
         device.Get(),
         static_cast<UINT>(mClientWidth),
@@ -948,6 +1224,7 @@ bool DirectXApp::Initialize() {
         mBackBufferFormat,
         mCbvSrvUavDescriptorSize,
         mRtvDescriptorSize);
+    StartupLog("RenderingSystem Initialize ok");
 
     // Инициализация проекционной матрицы
     XMMATRIX P = XMMatrixPerspectiveFovLH(0.25f * XM_PI,
@@ -955,6 +1232,7 @@ bool DirectXApp::Initialize() {
     XMStoreFloat4x4(&mProj, P);
 
     mTimer.Reset();
+    StartupLog("Initialize ok");
     return true;
 }
 
@@ -979,20 +1257,40 @@ void DirectXApp::OnResize() {
 // Обработка клавиатуры
 void DirectXApp::OnKeyDown(WPARAM wParam)
 {
-    // Пробел переключает режим отображения
-    if (wParam == VK_SPACE) {
+    // M toggles render mode; SPACE remains reserved for camera movement.
+    if (wParam == 'M') {
         mWireframeMode = !mWireframeMode;
 
         if (mWireframeMode) {
-            SetWindowText(window.GetHandle(), L"DirectX 12 Framework - Wireframe Mode (Press SPACE to switch)");
+            SetWindowText(window.GetHandle(), L"DirectX 12 Framework - Wireframe Mode (Press M to switch)");
         }
         else {
-            SetWindowText(window.GetHandle(), L"DirectX 12 Framework - Solid Mode (Press SPACE to switch)");
+            SetWindowText(window.GetHandle(), L"DirectX 12 Framework - Solid Mode (Press M to switch)");
         }
+    }
+
+    if (wParam == VK_F1 && !mF1KeyDown) {
+        mF1KeyDown = true;
+        mDebugViewMode = DebugViewMode::Default;
+    }
+
+    if (wParam == VK_F2 && !mF2KeyDown) {
+        mF2KeyDown = true;
+        mDebugViewMode = DebugViewMode::NormalMap;
+    }
+
+    if (wParam == VK_F3 && !mF3KeyDown) {
+        mF3KeyDown = true;
+        mDebugViewMode = DebugViewMode::Tessellation;
     }
 
     if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) {
         UpdateUvDirectionFromInput();
+    }
+
+    if (wParam == 'F' && !mShootKeyDown) {
+        mShootKeyDown = true;
+        ShootLightProjectile();
     }
 }
 
@@ -1001,6 +1299,17 @@ void DirectXApp::OnKeyUp(WPARAM wParam)
     if (wParam == VK_LEFT || wParam == VK_RIGHT || wParam == VK_UP || wParam == VK_DOWN) {
         UpdateUvDirectionFromInput();
     }
+
+    if (wParam == 'F') {
+        mShootKeyDown = false;
+    }
+
+    if (wParam == VK_F1)
+        mF1KeyDown = false;
+    if (wParam == VK_F2)
+        mF2KeyDown = false;
+    if (wParam == VK_F3)
+        mF3KeyDown = false;
 }
 
 int DirectXApp::Run() {
@@ -1034,15 +1343,34 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
-        if (mWireframeMode) {
+        if (mDebugViewMode == DebugViewMode::Tessellation) {
+            windowText += L" - Tessellation Debug";
+        }
+        else if (mDebugViewMode == DebugViewMode::NormalMap) {
+            windowText += L" - Normal Map Debug";
+        }
+        else if (mWireframeMode) {
             windowText += L" - Wireframe Mode";
         }
         else {
-            windowText += L" - Solid Mode";
+        windowText += L" - Solid Mode";
         }
+        windowText += L" Speed: " + std::to_wstring(mCameraSpeed) + L" (+/-)";
         windowText += L" FPS: " + std::to_wstring(fps);
         windowText += L" MSPF: " + std::to_wstring(mspf);
-        windowText += L" (Press SPACE to switch modes)";
+        windowText += L" Projectiles: " + std::to_wstring(mShotProjectiles.size());
+        windowText += L" Placed lights: " + std::to_wstring(mPlacedLights.size());
+        windowText += L"/" + std::to_wstring(MaxShotLights);
+        XMVECTOR eye = XMLoadFloat3(&mEyePos);
+        XMVECTOR center = XMLoadFloat3(&mSceneCenter);
+        float centerDistance = XMVectorGetX(XMVector3Length(eye - center));
+        float sceneRadius = 0.5f * (std::max)({ mSceneExtent.x, mSceneExtent.y, mSceneExtent.z });
+        float tessDistance = (std::max)(0.0f, centerDistance - sceneRadius);
+        float tessT = (std::clamp)((tessDistance - TessellationNearDistance) / (TessellationFarDistance - TessellationNearDistance), 0.0f, 1.0f);
+        float tessFactor = TessellationMaxFactor + (TessellationMinFactor - TessellationMaxFactor) * tessT;
+        windowText += L" Dist: " + std::to_wstring(tessDistance);
+        windowText += L" Tess: " + std::to_wstring(tessFactor);
+        windowText += L" (F1 default, F2 normals, F3 tessellation, M wireframe)";
 
         SetWindowText(window.GetHandle(), windowText.c_str());
 
@@ -1051,10 +1379,180 @@ void DirectXApp::CalculateFrameStats() {
     }
 }
 
+XMFLOAT3 DirectXApp::GetCameraForward() const
+{
+    XMFLOAT3 forward =
+    {
+        cosf(mPitch) * cosf(mYaw),
+        sinf(mPitch),
+        cosf(mPitch) * sinf(mYaw)
+    };
+
+    XMVECTOR forwardVec = XMVector3Normalize(XMLoadFloat3(&forward));
+    XMStoreFloat3(&forward, forwardVec);
+    return forward;
+}
+
+void DirectXApp::ShootLightProjectile()
+{
+    XMFLOAT3 forward = GetCameraForward();
+    const float maxDistance = mProjectileSpeed * mProjectileLifeTime;
+
+    ShotLightProjectile projectile;
+    projectile.Position = mEyePos;
+    projectile.Direction = forward;
+
+    RaycastHit hit;
+    if (RaycastScene(mEyePos, forward, maxDistance, hit))
+    {
+        projectile.HasHit = true;
+        projectile.HitPosition = hit.Position;
+        projectile.HitNormal = hit.Normal;
+        projectile.HitDistance = hit.Distance;
+    }
+
+    // Projectile is logical while flying; it becomes a real deferred point light on geometry impact.
+    mShotProjectiles.push_back(projectile);
+
+    std::ostringstream stream;
+    stream << "Shot light projectile. Projectiles=" << mShotProjectiles.size()
+        << " Hit=" << (projectile.HasHit ? "yes" : "no") << "\n";
+    OutputDebugStringA(stream.str().c_str());
+}
+
+void DirectXApp::UpdateShotLights(float dt)
+{
+    std::vector<ShotLightProjectile> activeProjectiles;
+    activeProjectiles.reserve(mShotProjectiles.size());
+
+    for (ShotLightProjectile projectile : mShotProjectiles)
+    {
+        projectile.Age += dt;
+        const float step = mProjectileSpeed * dt;
+        projectile.TravelDistance += step;
+
+        XMVECTOR pos = XMLoadFloat3(&projectile.Position);
+        XMVECTOR dir = XMLoadFloat3(&projectile.Direction);
+        pos += dir * step;
+        XMStoreFloat3(&projectile.Position, pos);
+
+        if (projectile.HasHit && projectile.TravelDistance >= projectile.HitDistance)
+        {
+            XMVECTOR hitPos = XMLoadFloat3(&projectile.HitPosition);
+            XMVECTOR hitNormal = XMLoadFloat3(&projectile.HitNormal);
+            XMFLOAT3 placedPosition;
+            XMStoreFloat3(&placedPosition, hitPos + hitNormal * mSurfaceLightOffset);
+            AddPlacedLight(placedPosition);
+            continue;
+        }
+
+        if (projectile.Age < mProjectileLifeTime)
+            activeProjectiles.push_back(projectile);
+    }
+
+    mShotProjectiles.swap(activeProjectiles);
+
+    for (DynamicPointLight& light : mPlacedLights)
+        light.Age += dt;
+}
+
+void DirectXApp::AddPlacedLight(const XMFLOAT3& position)
+{
+    if (mPlacedLights.size() >= MaxShotLights)
+        mPlacedLights.erase(mPlacedLights.begin());
+
+    DynamicPointLight placedLight;
+    placedLight.Light.Position = position;
+    placedLight.Light.Range = mShotLightRadius;
+    placedLight.Light.Color = mShotLightColor;
+    placedLight.Light.Intensity = mShotLightIntensity;
+    mPlacedLights.push_back(placedLight);
+
+    std::ostringstream stream;
+    stream << "Placed point light. Count=" << mPlacedLights.size()
+        << "/" << MaxShotLights << "\n";
+    OutputDebugStringA(stream.str().c_str());
+}
+
+bool DirectXApp::RaycastScene(
+    const XMFLOAT3& origin,
+    const XMFLOAT3& direction,
+    float maxDistance,
+    RaycastHit& outHit) const
+{
+    if (mSceneVertices.empty() || mSceneIndices.size() < 3)
+        return false;
+
+    const float epsilon = 1e-5f;
+    float closestDistance = maxDistance;
+    bool foundHit = false;
+
+    XMVECTOR rayOrigin = XMLoadFloat3(&origin);
+    XMVECTOR rayDirection = XMVector3Normalize(XMLoadFloat3(&direction));
+
+    for (size_t i = 0; i + 2 < mSceneIndices.size(); i += 3)
+    {
+        const Vertex& vertex0 = mSceneVertices[mSceneIndices[i + 0]];
+        const Vertex& vertex1 = mSceneVertices[mSceneIndices[i + 1]];
+        const Vertex& vertex2 = mSceneVertices[mSceneIndices[i + 2]];
+
+        XMVECTOR v0 = XMLoadFloat3(&vertex0.position);
+        XMVECTOR v1 = XMLoadFloat3(&vertex1.position);
+        XMVECTOR v2 = XMLoadFloat3(&vertex2.position);
+        XMVECTOR edge1 = v1 - v0;
+        XMVECTOR edge2 = v2 - v0;
+        XMVECTOR pvec = XMVector3Cross(rayDirection, edge2);
+
+        float det = XMVectorGetX(XMVector3Dot(edge1, pvec));
+        if (fabsf(det) < epsilon)
+            continue;
+
+        float invDet = 1.0f / det;
+        XMVECTOR tvec = rayOrigin - v0;
+        float u = XMVectorGetX(XMVector3Dot(tvec, pvec)) * invDet;
+        if (u < 0.0f || u > 1.0f)
+            continue;
+
+        XMVECTOR qvec = XMVector3Cross(tvec, edge1);
+        float v = XMVectorGetX(XMVector3Dot(rayDirection, qvec)) * invDet;
+        if (v < 0.0f || u + v > 1.0f)
+            continue;
+
+        float distance = XMVectorGetX(XMVector3Dot(edge2, qvec)) * invDet;
+        if (distance <= epsilon || distance >= closestDistance)
+            continue;
+
+        closestDistance = distance;
+        foundHit = true;
+
+        XMVECTOR hitPosition = rayOrigin + rayDirection * distance;
+        XMVECTOR normal = XMVector3Normalize(XMVector3Cross(edge1, edge2));
+        if (XMVectorGetX(XMVector3Dot(normal, rayDirection)) > 0.0f)
+            normal = -normal;
+
+        XMStoreFloat3(&outHit.Position, hitPosition);
+        XMStoreFloat3(&outHit.Normal, normal);
+        outHit.Distance = distance;
+    }
+
+    return foundHit;
+}
+
 void DirectXApp::Update(const Timer& gt)
 {
-    float dt = gt.DeltaTime();
-    float speed = 50.0f;
+    float dt = (std::min)(gt.DeltaTime(), 0.033f);
+    if (GetForegroundWindow() == window.GetHandle())
+    {
+        const bool increaseSpeed = (GetAsyncKeyState(VK_OEM_PLUS) & 0x8000) ||
+            (GetAsyncKeyState(VK_ADD) & 0x8000);
+        const bool decreaseSpeed = (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) ||
+            (GetAsyncKeyState(VK_SUBTRACT) & 0x8000);
+        const int speedDirection = static_cast<int>(increaseSpeed) - static_cast<int>(decreaseSpeed);
+        // Multiplicative adjustment gives fine control at low movement speeds.
+        mCameraSpeed = (std::clamp)(mCameraSpeed * std::exp2(speedDirection * dt),
+            CameraMinSpeed, CameraMaxSpeed);
+    }
+    float speed = mCameraSpeed;
 
     // ===== Forward Vector =====
     XMFLOAT3 forward =
@@ -1111,11 +1609,9 @@ void DirectXApp::Update(const Timer& gt)
 
     XMStoreFloat4x4(&mProj, proj);
 
-    if (mUvDirection.x != 0.0f || mUvDirection.y != 0.0f)
-    {
-        mUvOffset.x += mUvDirection.x * mUvSpeed * dt;
-        mUvOffset.y += mUvDirection.y * mUvSpeed * dt;
-    }
+    mUvOffset.x += mUvDirection.x * mUvSpeed * dt;
+    mUvOffset.y += mUvDirection.y * mUvSpeed * dt;
+    UpdateShotLights(dt);
 
     // ===== WVP =====
     XMMATRIX world = XMMatrixIdentity();
@@ -1172,7 +1668,9 @@ void DirectXApp::Draw(const Timer& gt)
     scene.Proj = mProj;
     scene.EyePos = mEyePos;
     scene.UvOffset = mUvOffset;
-    scene.Wireframe = mWireframeMode;
+    scene.DynamicPointLights = &mPlacedLights;
+    scene.Wireframe = mWireframeMode || mDebugViewMode == DebugViewMode::Tessellation;
+    scene.DebugViewMode = static_cast<UINT>(mDebugViewMode);
 
     mRenderingSystem->Render(
         mCommandList.Get(),
@@ -1195,6 +1693,157 @@ void DirectXApp::Draw(const Timer& gt)
     mSwapChain->Present(0, 0);
     mCurrBackBuffer = (mCurrBackBuffer + 1) % SwapChainBufferCount;
 
+    FlushCommandQueue();
+}
+
+void DirectXApp::CreateTextureFromFile(
+    const std::string& path,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& texture)
+{
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+    if (ext == ".tga")
+    {
+        CreateTextureFromTGA(path, texture);
+        return;
+    }
+
+    CreateTextureFromWIC(path, texture);
+}
+
+void DirectXApp::CreateTextureFromWIC(
+    const std::string& path,
+    Microsoft::WRL::ComPtr<ID3D12Resource>& texture)
+{
+    std::wstring widePath(path.begin(), path.end());
+
+    ComPtr<IWICImagingFactory> wicFactory;
+    ThrowIfFailed(CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&wicFactory)));
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    ThrowIfFailed(wicFactory->CreateDecoderFromFilename(
+        widePath.c_str(),
+        nullptr,
+        GENERIC_READ,
+        WICDecodeMetadataCacheOnLoad,
+        &decoder));
+
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ThrowIfFailed(decoder->GetFrame(0, &frame));
+
+    UINT width = 0;
+    UINT height = 0;
+    ThrowIfFailed(frame->GetSize(&width, &height));
+
+    ComPtr<IWICFormatConverter> converter;
+    ThrowIfFailed(wicFactory->CreateFormatConverter(&converter));
+    ThrowIfFailed(converter->Initialize(
+        frame.Get(),
+        GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom));
+
+    std::vector<BYTE> pixels(width * height * 4);
+    ThrowIfFailed(converter->CopyPixels(
+        nullptr,
+        width * 4,
+        static_cast<UINT>(pixels.size()),
+        pixels.data()));
+
+    D3D12_RESOURCE_DESC texDesc = {};
+    texDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.DepthOrArraySize = 1;
+    texDesc.MipLevels = 1;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    ThrowIfFailed(device->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &texDesc,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        nullptr,
+        IID_PPV_ARGS(&texture)));
+
+    UINT64 uploadSize = 0;
+    device->GetCopyableFootprints(&texDesc, 0, 1, 0, nullptr, nullptr, nullptr, &uploadSize);
+
+    D3D12_HEAP_PROPERTIES uploadHeap = {};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC bufferDesc = {};
+    bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bufferDesc.Width = uploadSize;
+    bufferDesc.Height = 1;
+    bufferDesc.DepthOrArraySize = 1;
+    bufferDesc.MipLevels = 1;
+    bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    bufferDesc.SampleDesc.Count = 1;
+
+    ComPtr<ID3D12Resource> uploadBuffer;
+    ThrowIfFailed(device->CreateCommittedResource(
+        &uploadHeap,
+        D3D12_HEAP_FLAG_NONE,
+        &bufferDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&uploadBuffer)));
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT numRows = 0;
+    UINT64 rowSizeInBytes = 0;
+    device->GetCopyableFootprints(&texDesc, 0, 1, 0, &footprint, &numRows, &rowSizeInBytes, nullptr);
+
+    void* mapped = nullptr;
+    uploadBuffer->Map(0, nullptr, &mapped);
+    BYTE* dest = reinterpret_cast<BYTE*>(mapped);
+    for (UINT y = 0; y < height; ++y)
+    {
+        memcpy(
+            dest + y * footprint.Footprint.RowPitch,
+            pixels.data() + y * width * 4,
+            width * 4);
+    }
+    uploadBuffer->Unmap(0, nullptr);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = texture.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = uploadBuffer.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint = footprint;
+
+    mCommandList->Reset(mDirectCmdListAlloc.Get(), nullptr);
+    mCommandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = texture.Get();
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    mCommandList->ResourceBarrier(1, &barrier);
+
+    mCommandList->Close();
+
+    ID3D12CommandList* cmdLists[] = { mCommandList.Get() };
+    mCommandQueue->ExecuteCommandLists(1, cmdLists);
     FlushCommandQueue();
 }
 
@@ -1319,7 +1968,7 @@ void DirectXApp::CreateTextureFromTGA(
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = texture.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
     mCommandList->ResourceBarrier(1, &barrier);
@@ -1421,7 +2070,7 @@ void DirectXApp::CreateColorTexture(
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = texture.Get();
     barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 
     mCommandList->ResourceBarrier(1, &barrier);

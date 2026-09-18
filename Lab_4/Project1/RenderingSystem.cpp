@@ -1,11 +1,40 @@
 #include "RenderingSystem.h"
 #include "d3dUtil.h"
 #include "ThrowIfFailed.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <windows.h>
 
 using namespace DirectX;
 
 namespace
 {
+    std::filesystem::path GetExeDirectory()
+    {
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).parent_path();
+    }
+
+    void StartupLog(const std::string& message)
+    {
+        OutputDebugStringA((message + "\n").c_str());
+
+        std::ofstream log(GetExeDirectory() / "Project1_startup.log", std::ios::app);
+        if (log)
+            log << message << '\n';
+    }
+
+    void StartupLogHr(const std::string& message, HRESULT hr)
+    {
+        char buffer[128] = {};
+        sprintf_s(buffer, " HRESULT=0x%08X", static_cast<unsigned int>(hr));
+        StartupLog(message + buffer);
+    }
+
     D3D12_RESOURCE_BARRIER TransitionBarrier(
         ID3D12Resource* resource,
         D3D12_RESOURCE_STATES before,
@@ -114,16 +143,20 @@ bool GBuffer::Initialize(
     return true;
 }
 
-void GBuffer::Clear(ID3D12GraphicsCommandList* commandList) const
+void GBuffer::ClearGeometryTargets(ID3D12GraphicsCommandList* commandList) const
 {
     const float clearAlbedo[] = { 0.0f, 0.0f, 0.0f, 1.0f };
     const float clearNormal[] = { 0.5f, 0.5f, 1.0f, 1.0f };
-    const float clearLighting[] = { 0.0f, 0.0f, 0.0f, 1.0f };
 
     commandList->ClearRenderTargetView(GetAlbedoRtv(), clearAlbedo, 0, nullptr);
     commandList->ClearRenderTargetView(GetNormalRtv(), clearNormal, 0, nullptr);
-    commandList->ClearRenderTargetView(GetLightingRtv(), clearLighting, 0, nullptr);
     commandList->ClearDepthStencilView(GetDepthDsv(), D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+}
+
+void GBuffer::ClearLightingTarget(ID3D12GraphicsCommandList* commandList) const
+{
+    const float clearLighting[] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    commandList->ClearRenderTargetView(GetLightingRtv(), clearLighting, 0, nullptr);
 }
 
 void GBuffer::BindForGeometryPass(ID3D12GraphicsCommandList* commandList) const
@@ -203,14 +236,33 @@ bool RenderingSystem::Initialize(
 {
     mDevice = device;
     mCbvSrvUavDescriptorSize = cbvSrvUavDescriptorSize;
+    mWidth = width;
+    mHeight = height;
 
+    StartupLog("RenderingSystem BuildLights begin");
     BuildLights();
+    StartupLog("RenderingSystem BuildLights ok");
+    StartupLog("RenderingSystem GBuffer Initialize begin");
     mGBuffer.Initialize(device, width, height, rtvDescriptorSize);
+    StartupLog("RenderingSystem GBuffer Initialize ok");
+    StartupLog("RenderingSystem BuildPointLightVolumeMesh begin");
+    BuildPointLightVolumeMesh();
+    StartupLog("RenderingSystem BuildPointLightVolumeMesh ok");
+    StartupLog("RenderingSystem BuildShaders begin");
     BuildShaders();
+    StartupLog("RenderingSystem BuildShaders ok");
+    StartupLog("RenderingSystem BuildRootSignatures begin");
     BuildRootSignatures();
+    StartupLog("RenderingSystem BuildRootSignatures ok");
+    StartupLog("RenderingSystem BuildPsos begin");
     BuildPsos(backBufferFormat);
+    StartupLog("RenderingSystem BuildPsos ok");
+    StartupLog("RenderingSystem BuildDeferredDescriptorHeap begin");
     BuildDeferredDescriptorHeap();
+    StartupLog("RenderingSystem BuildDeferredDescriptorHeap ok");
+    StartupLog("RenderingSystem BuildFrameConstants begin");
     BuildFrameConstants();
+    StartupLog("RenderingSystem BuildFrameConstants ok");
 
     return true;
 }
@@ -224,23 +276,35 @@ void RenderingSystem::Render(
     UpdateFrameConstants(scene);
 
     mGBuffer.TransitionToGeometryPass(commandList);
-    mGBuffer.Clear(commandList);
+    mGBuffer.ClearGeometryTargets(commandList);
     mGBuffer.BindForGeometryPass(commandList);
 
     commandList->SetGraphicsRootSignature(mGeometryRootSignature.Get());
     ID3D12DescriptorHeap* materialHeaps[] = { scene.MaterialHeap };
     commandList->SetDescriptorHeaps(1, materialHeaps);
     commandList->SetGraphicsRootDescriptorTable(0, scene.MaterialHeap->GetGPUDescriptorHandleForHeapStart());
-    commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     commandList->IASetVertexBuffers(0, 1, &scene.VertexBufferView);
     commandList->IASetIndexBuffer(&scene.IndexBufferView);
-    commandList->SetPipelineState(scene.Wireframe ? mGeometryWireframePso.Get() : mGeometryPso.Get());
 
     for (auto& submesh : *scene.Submeshes)
     {
         Material* material = FindMaterial(scene, submesh.MaterialName);
         if (!material)
             continue;
+
+        const bool hasDisplacement = !material->DisplacementMap.empty() &&
+            material->DisplacementTexture.Get() != nullptr &&
+            material->DisplacementScale > 0.0f;
+        if (hasDisplacement)
+        {
+            commandList->SetPipelineState(scene.Wireframe ? mGeometryWireframePso.Get() : mGeometryPso.Get());
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST);
+        }
+        else
+        {
+            commandList->SetPipelineState(scene.Wireframe ? mGeometryNoTessWireframePso.Get() : mGeometryNoTessPso.Get());
+            commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        }
 
         ObjectConstants objectConstants;
         XMMATRIX view = XMLoadFloat4x4(&scene.View);
@@ -249,7 +313,16 @@ void RenderingSystem::Render(
 
         XMStoreFloat4x4(&objectConstants.mWorldViewProj, XMMatrixTranspose(wvp));
         objectConstants.uvTiling = material->Tiling;
-        objectConstants.uvOffset = scene.UvOffset;
+        objectConstants.uvOffset =
+        {
+            scene.UvOffset.x + material->StaticUvOffset.x,
+            scene.UvOffset.y + material->StaticUvOffset.y
+        };
+        objectConstants.eyePosAndDisplacementScale =
+            XMFLOAT4(scene.EyePos.x, scene.EyePos.y, scene.EyePos.z, material->DisplacementScale);
+        objectConstants.tessellationParams = material->TessellationParams;
+        objectConstants.normalParams =
+            XMFLOAT4(material->NormalStrength, 2048.0f, 2048.0f, static_cast<float>(scene.DebugViewMode));
 
         scene.ObjectConstantsBuffer->CopyData(0, objectConstants);
 
@@ -261,6 +334,7 @@ void RenderingSystem::Render(
 
     mGBuffer.TransitionToLightingPass(commandList);
     mGBuffer.TransitionLightingToRenderTarget(commandList);
+    mGBuffer.ClearLightingTarget(commandList);
 
     ID3D12DescriptorHeap* deferredHeaps[] = { mDeferredHeap.Get() };
     commandList->SetDescriptorHeaps(1, deferredHeaps);
@@ -277,6 +351,34 @@ void RenderingSystem::Render(
     frameCbvHandle.ptr += 4 * mCbvSrvUavDescriptorSize;
     commandList->SetGraphicsRootDescriptorTable(1, frameCbvHandle);
     commandList->DrawInstanced(3, 1, 0, 0);
+
+    // Dynamic point lights are accumulated with additive blending by drawing one light volume per source.
+    commandList->SetGraphicsRootSignature(mPointLightRootSignature.Get());
+    commandList->SetPipelineState(mPointLightPso.Get());
+    commandList->SetGraphicsRootDescriptorTable(0, gbufferSrvHandle);
+    commandList->SetGraphicsRootDescriptorTable(1, frameCbvHandle);
+    commandList->IASetVertexBuffers(0, 1, &mPointLightVertexBufferView);
+    commandList->IASetIndexBuffer(&mPointLightIndexBufferView);
+
+    UINT lightIndex = 0;
+    for (const PointLight& light : mPointLights)
+    {
+        if (lightIndex >= MaxPointLightVolumes)
+            break;
+
+        RenderPointLightVolume(commandList, light, lightIndex++);
+    }
+
+    if (scene.DynamicPointLights)
+    {
+        for (const DynamicPointLight& dynamicLight : *scene.DynamicPointLights)
+        {
+            if (lightIndex >= MaxPointLightVolumes)
+                break;
+
+            RenderPointLightVolume(commandList, dynamicLight.Light, lightIndex++);
+        }
+    }
 
     mGBuffer.TransitionLightingToShaderResource(commandList);
 
@@ -299,18 +401,21 @@ void RenderingSystem::Render(
 void RenderingSystem::BuildLights()
 {
     mDirectionalLights = { {} };
+    mDirectionalLights[0].Direction = { -0.35f, -0.85f, 0.35f };
+    mDirectionalLights[0].Intensity = 1.05f;
+    mDirectionalLights[0].Color = { 1.0f, 0.90f, 0.72f };
 
     mPointLights =
     {
-        { { -3.0f, 2.5f, -2.0f }, 8.0f, { 1.0f, 0.7f, 0.4f }, 5.0f },
-        { {  2.0f, 2.0f,  1.0f }, 7.0f, { 0.4f, 0.7f, 1.0f }, 4.0f },
-        { {  0.0f, 3.0f,  4.0f }, 9.0f, { 0.8f, 1.0f, 0.6f }, 3.5f }
+        { { -3.2f, 2.4f, -3.6f }, 7.5f, { 1.0f, 0.62f, 0.34f }, 0.55f },
+        { {  3.0f, 3.2f,  2.8f }, 8.0f, { 0.45f, 0.62f, 1.0f }, 0.35f },
+        { {  0.5f, 4.6f, -0.5f }, 7.0f, { 0.85f, 1.0f, 0.72f }, 0.25f }
     };
 
     mSpotLights =
     {
-        { { -1.5f, 4.0f, -6.0f }, 14.0f, { 0.2f, -1.0f, 0.5f }, 0.75f, { 1.0f, 0.9f, 0.7f }, 7.0f },
-        { {  2.5f, 4.5f,  5.0f }, 12.0f, { -0.2f, -1.0f, -0.4f }, 0.8f, { 0.6f, 0.8f, 1.0f }, 6.0f }
+        { { -2.5f, 5.2f, -5.5f }, 13.0f, { 0.25f, -1.0f, 0.45f }, 0.72f, { 1.0f, 0.86f, 0.62f }, 0.75f },
+        { {  3.8f, 4.2f,  3.8f }, 11.0f, { -0.45f, -0.8f, -0.35f }, 0.80f, { 0.55f, 0.72f, 1.0f }, 0.42f }
     };
 }
 
@@ -322,7 +427,7 @@ void RenderingSystem::BuildRootSignatures()
     geometryRanges[0].BaseShaderRegister = 0;
     geometryRanges[0].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
     geometryRanges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    geometryRanges[1].NumDescriptors = 1;
+    geometryRanges[1].NumDescriptors = 3;
     geometryRanges[1].BaseShaderRegister = 0;
     geometryRanges[1].OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
 
@@ -334,7 +439,8 @@ void RenderingSystem::BuildRootSignatures()
     geometryParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     geometryParams[1].DescriptorTable.NumDescriptorRanges = 1;
     geometryParams[1].DescriptorTable.pDescriptorRanges = &geometryRanges[1];
-    geometryParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    // Displacement is sampled in the domain shader, normal/albedo in the pixel shader.
+    geometryParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_STATIC_SAMPLER_DESC sampler = {};
     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -342,7 +448,7 @@ void RenderingSystem::BuildRootSignatures()
     sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     sampler.ShaderRegister = 0;
-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
     D3D12_ROOT_SIGNATURE_DESC geometryDesc = {};
     geometryDesc.NumParameters = 2;
@@ -396,6 +502,32 @@ void RenderingSystem::BuildRootSignatures()
     ThrowIfFailed(D3D12SerializeRootSignature(&lightingDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error));
     ThrowIfFailed(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mLightingRootSignature)));
 
+    D3D12_ROOT_PARAMETER pointLightParams[3] = {};
+    pointLightParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    pointLightParams[0].DescriptorTable.NumDescriptorRanges = 1;
+    pointLightParams[0].DescriptorTable.pDescriptorRanges = &lightingRanges[0];
+    pointLightParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    pointLightParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    pointLightParams[1].DescriptorTable.NumDescriptorRanges = 1;
+    pointLightParams[1].DescriptorTable.pDescriptorRanges = &lightingRanges[1];
+    pointLightParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    pointLightParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    pointLightParams[2].Descriptor.ShaderRegister = 1;
+    pointLightParams[2].Descriptor.RegisterSpace = 0;
+    pointLightParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC pointLightDesc = {};
+    pointLightDesc.NumParameters = 3;
+    pointLightDesc.pParameters = pointLightParams;
+    pointLightDesc.NumStaticSamplers = 1;
+    pointLightDesc.pStaticSamplers = &pointSampler;
+    pointLightDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    serialized.Reset();
+    error.Reset();
+    ThrowIfFailed(D3D12SerializeRootSignature(&pointLightDesc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &error));
+    ThrowIfFailed(mDevice->CreateRootSignature(0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&mPointLightRootSignature)));
+
     D3D12_DESCRIPTOR_RANGE finalRange = {};
     finalRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     finalRange.NumDescriptors = 1;
@@ -427,21 +559,25 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
     {
         { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
         { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
-        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TANGENT", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 32, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "BINORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 44, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
     };
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryPso = {};
     geometryPso.InputLayout = { inputLayout, _countof(inputLayout) };
     geometryPso.pRootSignature = mGeometryRootSignature.Get();
     geometryPso.VS = { reinterpret_cast<BYTE*>(mGeometryVs->GetBufferPointer()), mGeometryVs->GetBufferSize() };
+    geometryPso.HS = { reinterpret_cast<BYTE*>(mGeometryHs->GetBufferPointer()), mGeometryHs->GetBufferSize() };
+    geometryPso.DS = { reinterpret_cast<BYTE*>(mGeometryDs->GetBufferPointer()), mGeometryDs->GetBufferSize() };
     geometryPso.PS = { reinterpret_cast<BYTE*>(mGeometryPs->GetBufferPointer()), mGeometryPs->GetBufferSize() };
     geometryPso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    geometryPso.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    geometryPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     geometryPso.RasterizerState.DepthClipEnable = TRUE;
     geometryPso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     geometryPso.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     geometryPso.SampleMask = UINT_MAX;
-    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    geometryPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
     geometryPso.NumRenderTargets = 2;
     geometryPso.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
     geometryPso.RTVFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -450,11 +586,46 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
     geometryPso.DepthStencilState.DepthEnable = TRUE;
     geometryPso.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
     geometryPso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
-    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&mGeometryPso)));
+    HRESULT hr = mDevice->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&mGeometryPso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create geometry PSO failed", hr);
+        ThrowIfFailed(hr, "Create geometry PSO failed");
+    }
+    StartupLog("Create geometry PSO ok");
 
     geometryPso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
     geometryPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&mGeometryWireframePso)));
+    hr = mDevice->CreateGraphicsPipelineState(&geometryPso, IID_PPV_ARGS(&mGeometryWireframePso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create geometry wireframe PSO failed", hr);
+        ThrowIfFailed(hr, "Create geometry wireframe PSO failed");
+    }
+    StartupLog("Create geometry wireframe PSO ok");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryNoTessPso = geometryPso;
+    geometryNoTessPso.VS = { reinterpret_cast<BYTE*>(mGeometryNoTessVs->GetBufferPointer()), mGeometryNoTessVs->GetBufferSize() };
+    geometryNoTessPso.HS = {};
+    geometryNoTessPso.DS = {};
+    geometryNoTessPso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    geometryNoTessPso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    hr = mDevice->CreateGraphicsPipelineState(&geometryNoTessPso, IID_PPV_ARGS(&mGeometryNoTessPso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create geometry non-tessellated PSO failed", hr);
+        ThrowIfFailed(hr, "Create geometry non-tessellated PSO failed");
+    }
+    StartupLog("Create geometry non-tessellated PSO ok");
+
+    geometryNoTessPso.RasterizerState.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    hr = mDevice->CreateGraphicsPipelineState(&geometryNoTessPso, IID_PPV_ARGS(&mGeometryNoTessWireframePso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create geometry non-tessellated wireframe PSO failed", hr);
+        ThrowIfFailed(hr, "Create geometry non-tessellated wireframe PSO failed");
+    }
+    StartupLog("Create geometry non-tessellated wireframe PSO ok");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC lightingPso = {};
     lightingPso.pRootSignature = mLightingRootSignature.Get();
@@ -470,14 +641,54 @@ void RenderingSystem::BuildPsos(DXGI_FORMAT backBufferFormat)
     lightingPso.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
     lightingPso.SampleDesc.Count = 1;
     lightingPso.DepthStencilState.DepthEnable = FALSE;
-    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&lightingPso, IID_PPV_ARGS(&mLightingPso)));
+    hr = mDevice->CreateGraphicsPipelineState(&lightingPso, IID_PPV_ARGS(&mLightingPso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create lighting PSO failed", hr);
+        ThrowIfFailed(hr, "Create lighting PSO failed");
+    }
+    StartupLog("Create lighting PSO ok");
+
+    D3D12_INPUT_ELEMENT_DESC pointLightInputLayout[] =
+    {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 }
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pointLightPso = lightingPso;
+    pointLightPso.InputLayout = { pointLightInputLayout, _countof(pointLightInputLayout) };
+    pointLightPso.pRootSignature = mPointLightRootSignature.Get();
+    pointLightPso.VS = { reinterpret_cast<BYTE*>(mPointLightVs->GetBufferPointer()), mPointLightVs->GetBufferSize() };
+    pointLightPso.PS = { reinterpret_cast<BYTE*>(mPointLightPs->GetBufferPointer()), mPointLightPs->GetBufferSize() };
+    pointLightPso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pointLightPso.BlendState.RenderTarget[0].BlendEnable = TRUE;
+    pointLightPso.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    pointLightPso.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ONE;
+    pointLightPso.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pointLightPso.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pointLightPso.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+    pointLightPso.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pointLightPso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    // This is additive light accumulation, not alpha transparency blending.
+    hr = mDevice->CreateGraphicsPipelineState(&pointLightPso, IID_PPV_ARGS(&mPointLightPso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create point light PSO failed", hr);
+        ThrowIfFailed(hr, "Create point light PSO failed");
+    }
+    StartupLog("Create point light PSO ok");
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC finalPso = lightingPso;
     finalPso.pRootSignature = mFinalRootSignature.Get();
     finalPso.VS = { reinterpret_cast<BYTE*>(mFinalVs->GetBufferPointer()), mFinalVs->GetBufferSize() };
     finalPso.PS = { reinterpret_cast<BYTE*>(mFinalPs->GetBufferPointer()), mFinalPs->GetBufferSize() };
     finalPso.RTVFormats[0] = backBufferFormat;
-    ThrowIfFailed(mDevice->CreateGraphicsPipelineState(&finalPso, IID_PPV_ARGS(&mFinalPso)));
+    hr = mDevice->CreateGraphicsPipelineState(&finalPso, IID_PPV_ARGS(&mFinalPso));
+    if (FAILED(hr))
+    {
+        StartupLogHr("Create final PSO failed", hr);
+        ThrowIfFailed(hr, "Create final PSO failed");
+    }
+    StartupLog("Create final PSO ok");
 }
 
 void RenderingSystem::BuildDeferredDescriptorHeap()
@@ -516,6 +727,7 @@ void RenderingSystem::BuildDeferredDescriptorHeap()
 void RenderingSystem::BuildFrameConstants()
 {
     mFrameConstants = std::make_unique<UploadBuffer<FrameConstants>>(mDevice.Get(), 1, true);
+    mPointLightConstants = std::make_unique<UploadBuffer<PointLightVolumeConstants>>(mDevice.Get(), MaxPointLightVolumes, true);
 
     UINT cbSize = d3dUtil::CalcConstantBufferByteSize(sizeof(FrameConstants));
     D3D12_CONSTANT_BUFFER_VIEW_DESC cbvDesc = {};
@@ -531,11 +743,125 @@ void RenderingSystem::BuildShaders()
 {
     const std::wstring shaderFile = L"../Project1/shaders.hlsl";
     mGeometryVs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryVS", "vs_5_0");
+    mGeometryNoTessVs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryNoTessVS", "vs_5_0");
+    mGeometryHs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryHS", "hs_5_0");
+    mGeometryDs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryDS", "ds_5_0");
     mGeometryPs = d3dUtil::CompileShader(shaderFile, nullptr, "GeometryPS", "ps_5_0");
     mLightingVs = d3dUtil::CompileShader(shaderFile, nullptr, "LightingVS", "vs_5_0");
     mLightingPs = d3dUtil::CompileShader(shaderFile, nullptr, "LightingPS", "ps_5_0");
+    mPointLightVs = d3dUtil::CompileShader(shaderFile, nullptr, "PointLightVolumeVS", "vs_5_0");
+    mPointLightPs = d3dUtil::CompileShader(shaderFile, nullptr, "PointLightVolumePS", "ps_5_0");
     mFinalVs = d3dUtil::CompileShader(shaderFile, nullptr, "FinalVS", "vs_5_0");
     mFinalPs = d3dUtil::CompileShader(shaderFile, nullptr, "FinalPS", "ps_5_0");
+}
+
+void RenderingSystem::BuildPointLightVolumeMesh()
+{
+    constexpr UINT sliceCount = 24;
+    constexpr UINT stackCount = 12;
+    constexpr float pi = 3.1415926535f;
+
+    std::vector<XMFLOAT3> vertices;
+    std::vector<uint32_t> indices;
+
+    vertices.push_back({ 0.0f, 1.0f, 0.0f });
+    for (UINT stack = 1; stack <= stackCount - 1; ++stack)
+    {
+        float phi = pi * static_cast<float>(stack) / static_cast<float>(stackCount);
+        for (UINT slice = 0; slice <= sliceCount; ++slice)
+        {
+            float theta = 2.0f * pi * static_cast<float>(slice) / static_cast<float>(sliceCount);
+            vertices.push_back({
+                sinf(phi) * cosf(theta),
+                cosf(phi),
+                sinf(phi) * sinf(theta)
+            });
+        }
+    }
+    vertices.push_back({ 0.0f, -1.0f, 0.0f });
+
+    for (UINT slice = 0; slice < sliceCount; ++slice)
+    {
+        indices.push_back(0);
+        indices.push_back(slice + 1);
+        indices.push_back(slice + 2);
+    }
+
+    UINT baseIndex = 1;
+    UINT ringVertexCount = sliceCount + 1;
+    for (UINT stack = 0; stack < stackCount - 2; ++stack)
+    {
+        for (UINT slice = 0; slice < sliceCount; ++slice)
+        {
+            indices.push_back(baseIndex + stack * ringVertexCount + slice);
+            indices.push_back(baseIndex + stack * ringVertexCount + slice + 1);
+            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice);
+
+            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice);
+            indices.push_back(baseIndex + stack * ringVertexCount + slice + 1);
+            indices.push_back(baseIndex + (stack + 1) * ringVertexCount + slice + 1);
+        }
+    }
+
+    UINT southPoleIndex = static_cast<UINT>(vertices.size() - 1);
+    baseIndex = southPoleIndex - ringVertexCount;
+    for (UINT slice = 0; slice < sliceCount; ++slice)
+    {
+        indices.push_back(southPoleIndex);
+        indices.push_back(baseIndex + slice + 1);
+        indices.push_back(baseIndex + slice);
+    }
+
+    const UINT vertexBufferSize = static_cast<UINT>(vertices.size() * sizeof(XMFLOAT3));
+    const UINT indexBufferSize = static_cast<UINT>(indices.size() * sizeof(uint32_t));
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC vertexDesc = {};
+    vertexDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    vertexDesc.Width = vertexBufferSize;
+    vertexDesc.Height = 1;
+    vertexDesc.DepthOrArraySize = 1;
+    vertexDesc.MipLevels = 1;
+    vertexDesc.SampleDesc.Count = 1;
+    vertexDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    ThrowIfFailed(mDevice->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &vertexDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&mPointLightVertexBuffer)));
+
+    void* mappedData = nullptr;
+    mPointLightVertexBuffer->Map(0, nullptr, &mappedData);
+    memcpy(mappedData, vertices.data(), vertexBufferSize);
+    mPointLightVertexBuffer->Unmap(0, nullptr);
+
+    D3D12_RESOURCE_DESC indexDesc = vertexDesc;
+    indexDesc.Width = indexBufferSize;
+    ThrowIfFailed(mDevice->CreateCommittedResource(
+        &heapProps,
+        D3D12_HEAP_FLAG_NONE,
+        &indexDesc,
+        D3D12_RESOURCE_STATE_GENERIC_READ,
+        nullptr,
+        IID_PPV_ARGS(&mPointLightIndexBuffer)));
+
+    mPointLightIndexBuffer->Map(0, nullptr, &mappedData);
+    memcpy(mappedData, indices.data(), indexBufferSize);
+    mPointLightIndexBuffer->Unmap(0, nullptr);
+
+    mPointLightVertexBufferView.BufferLocation = mPointLightVertexBuffer->GetGPUVirtualAddress();
+    mPointLightVertexBufferView.StrideInBytes = sizeof(XMFLOAT3);
+    mPointLightVertexBufferView.SizeInBytes = vertexBufferSize;
+
+    mPointLightIndexBufferView.BufferLocation = mPointLightIndexBuffer->GetGPUVirtualAddress();
+    mPointLightIndexBufferView.Format = DXGI_FORMAT_R32_UINT;
+    mPointLightIndexBufferView.SizeInBytes = indexBufferSize;
+    mPointLightIndexCount = static_cast<UINT>(indices.size());
 }
 
 void RenderingSystem::UpdateFrameConstants(const SceneRenderContext& scene)
@@ -544,14 +870,21 @@ void RenderingSystem::UpdateFrameConstants(const SceneRenderContext& scene)
 
     XMMATRIX view = XMLoadFloat4x4(&scene.View);
     XMMATRIX proj = XMLoadFloat4x4(&scene.Proj);
-    XMMATRIX invViewProj = XMMatrixInverse(nullptr, view * proj);
+    XMMATRIX viewProj = view * proj;
+    XMMATRIX invViewProj = XMMatrixInverse(nullptr, viewProj);
     XMStoreFloat4x4(&frame.InvViewProj, XMMatrixTranspose(invViewProj));
+    XMStoreFloat4x4(&frame.ViewProj, XMMatrixTranspose(viewProj));
     frame.CameraPosition = XMFLOAT4(scene.EyePos.x, scene.EyePos.y, scene.EyePos.z, 1.0f);
     frame.LightCounts = XMFLOAT4(
         static_cast<float>(mDirectionalLights.size()),
-        static_cast<float>(mPointLights.size()),
+        scene.DynamicPointLights ? static_cast<float>(scene.DynamicPointLights->size()) : 0.0f,
         static_cast<float>(mSpotLights.size()),
         0.0f);
+    frame.ScreenSize = XMFLOAT4(
+        static_cast<float>(mWidth),
+        static_cast<float>(mHeight),
+        1.0f / static_cast<float>(mWidth),
+        1.0f / static_cast<float>(mHeight));
 
     for (size_t i = 0; i < mDirectionalLights.size() && i < MaxDirectionalLights; ++i)
     {
@@ -559,14 +892,6 @@ void RenderingSystem::UpdateFrameConstants(const SceneRenderContext& scene)
             XMFLOAT4(mDirectionalLights[i].Direction.x, mDirectionalLights[i].Direction.y, mDirectionalLights[i].Direction.z, mDirectionalLights[i].Intensity);
         frame.DirectionalLights[i].Color =
             XMFLOAT4(mDirectionalLights[i].Color.x, mDirectionalLights[i].Color.y, mDirectionalLights[i].Color.z, 1.0f);
-    }
-
-    for (size_t i = 0; i < mPointLights.size() && i < MaxPointLights; ++i)
-    {
-        frame.PointLights[i].PositionRange =
-            XMFLOAT4(mPointLights[i].Position.x, mPointLights[i].Position.y, mPointLights[i].Position.z, mPointLights[i].Range);
-        frame.PointLights[i].ColorIntensity =
-            XMFLOAT4(mPointLights[i].Color.x, mPointLights[i].Color.y, mPointLights[i].Color.z, mPointLights[i].Intensity);
     }
 
     for (size_t i = 0; i < mSpotLights.size() && i < MaxSpotLights; ++i)
@@ -580,6 +905,23 @@ void RenderingSystem::UpdateFrameConstants(const SceneRenderContext& scene)
     }
 
     mFrameConstants->CopyData(0, frame);
+}
+
+void RenderingSystem::RenderPointLightVolume(
+    ID3D12GraphicsCommandList* commandList,
+    const PointLight& light,
+    UINT lightIndex)
+{
+    PointLightVolumeConstants constants = {};
+    constants.PositionRange = XMFLOAT4(light.Position.x, light.Position.y, light.Position.z, light.Range);
+    constants.ColorIntensity = XMFLOAT4(light.Color.x, light.Color.y, light.Color.z, light.Intensity);
+    mPointLightConstants->CopyData(lightIndex, constants);
+
+    const UINT cbSize = d3dUtil::CalcConstantBufferByteSize(sizeof(PointLightVolumeConstants));
+    D3D12_GPU_VIRTUAL_ADDRESS cbAddress =
+        mPointLightConstants->Resource()->GetGPUVirtualAddress() + static_cast<UINT64>(lightIndex) * cbSize;
+    commandList->SetGraphicsRootConstantBufferView(2, cbAddress);
+    commandList->DrawIndexedInstanced(mPointLightIndexCount, 1, 0, 0, 0);
 }
 
 Material* RenderingSystem::FindMaterial(const SceneRenderContext& scene, const std::string& materialName) const

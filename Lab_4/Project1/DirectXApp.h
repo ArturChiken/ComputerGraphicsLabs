@@ -13,6 +13,8 @@
 #include "UploadBuffer.h"
 #include "ObjectConstants.h"
 #include <memory>
+#include <cstddef>
+#include <cstdint>
 #include "MathHelper.h"
 #include <DirectXMath.h>
 #include "Material.h"
@@ -36,7 +38,7 @@ public:
     virtual bool InitializeApp();
     virtual void Update(const Timer& gt);
     virtual void Draw(const Timer& gt);
-    void BuildObj(const std::string& path);
+    void BuildModel(const std::string& path);
     virtual void CalculateFrameStats();
 
     // Управление таймером
@@ -66,10 +68,51 @@ private:
     XMFLOAT2 mUvOffset = { 0.0f, 0.0f };
     XMFLOAT2 mUvDirection = { 0.0f, 0.0f };
     float mUvSpeed = 0.2f;
+    float mCameraSpeed = 2.0f;
+
+    struct ShotLightProjectile
+    {
+        XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
+        XMFLOAT3 Direction = { 0.0f, 0.0f, 1.0f };
+        XMFLOAT3 HitPosition = { 0.0f, 0.0f, 0.0f };
+        XMFLOAT3 HitNormal = { 0.0f, 1.0f, 0.0f };
+        float Age = 0.0f;
+        float TravelDistance = 0.0f;
+        float HitDistance = 0.0f;
+        bool HasHit = false;
+    };
+
+    struct RaycastHit
+    {
+        XMFLOAT3 Position = { 0.0f, 0.0f, 0.0f };
+        XMFLOAT3 Normal = { 0.0f, 1.0f, 0.0f };
+        float Distance = 0.0f;
+    };
+
+    static constexpr size_t MaxShotLights = 256;
+    float mShotLightRadius = 6.0f;
+    XMFLOAT3 mShotLightColor = { 1.0f, 0.72f, 0.35f };
+    float mShotLightIntensity = 5.5f;
+    float mProjectileSpeed = 55.0f;
+    float mProjectileLifeTime = 4.0f;
+    float mSurfaceLightOffset = 0.08f;
+    bool mShootKeyDown = false;
+    std::vector<ShotLightProjectile> mShotProjectiles;
+    std::vector<DynamicPointLight> mPlacedLights;
+    std::vector<Vertex> mSceneVertices;
+    std::vector<uint32_t> mSceneIndices;
+    XMFLOAT3 mSceneCenter = { 0.0f, 0.0f, 0.0f };
+    XMFLOAT3 mSceneExtent = { 1.0f, 1.0f, 1.0f };
 
     std::vector<Submesh> mSubmeshes;
     std::vector<Material> mMaterials;
     void CreateTextureFromTGA(
+        const std::string& path,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
+    void CreateTextureFromWIC(
+        const std::string& path,
+        Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
+    void CreateTextureFromFile(
         const std::string& path,
         Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
 
@@ -125,6 +168,7 @@ private:
     Timer mTimer;
     bool mAppPaused = false;
     bool mResizing = false;
+    bool mComInitialized = false;
     int mFrameCount = 0;
     float mTimeElapsed = 0.0f;
     std::wstring mMainWndCaption = L"DirectX 12 Framework";
@@ -151,6 +195,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mPSO;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> mWireframePSO;  // Второй PSO для проволочного каркаса
     bool mWireframeMode = false;  // Флаг режима отображения
+    enum class DebugViewMode : UINT { Default = 1, NormalMap = 2, Tessellation = 3 };
+    DebugViewMode mDebugViewMode = DebugViewMode::Default;
+    bool mF1KeyDown = false;
+    bool mF2KeyDown = false;
+    bool mF3KeyDown = false;
 
     // Математика для камеры
     float mTheta = 1.5f * XM_PI;
@@ -161,7 +210,7 @@ private:
     XMFLOAT4X4 mView = MathHelper::Identity4x4();
     XMFLOAT4X4 mProj = MathHelper::Identity4x4();
 
-    UINT mIndexCount;
+    UINT mIndexCount = 0;
 
     // Вспомогательные методы инициализации
     bool CreateDXGIFactory();
@@ -191,6 +240,12 @@ private:
         const DirectX::XMFLOAT3& color,
         Microsoft::WRL::ComPtr<ID3D12Resource>& texture);
     void UpdateUvDirectionFromInput();
+    XMFLOAT3 GetCameraForward() const;
+    void ShootLightProjectile();
+    void UpdateShotLights(float dt);
+    void AddPlacedLight(const XMFLOAT3& position);
+    bool RaycastScene(const XMFLOAT3& origin, const XMFLOAT3& direction, float maxDistance, RaycastHit& outHit) const;
+    void FitCameraToLoadedScene();
 
     // Методы для доступа к ресурсам
     ID3D12Resource* CurrentBackBuffer() const;

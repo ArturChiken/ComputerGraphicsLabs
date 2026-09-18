@@ -8,7 +8,9 @@ struct ObjectConstants
     DirectX::XMFLOAT2 uvTiling;
     DirectX::XMFLOAT2 uvOffset;
 
-    DirectX::XMFLOAT4 padding;
+    DirectX::XMFLOAT4 eyePosAndDisplacementScale = { 0.0f, 0.0f, 0.0f, 0.0f };
+    DirectX::XMFLOAT4 tessellationParams = { 8.0f, 1.0f, 0.0f, 0.5f };
+    DirectX::XMFLOAT4 normalParams = { 1.0f, 2048.0f, 2048.0f, 0.0f };
 
     ObjectConstants()
     {

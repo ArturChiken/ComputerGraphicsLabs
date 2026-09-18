@@ -1,5 +1,48 @@
 ﻿#include "d3dUtil.h"
 #include "ThrowIfFailed.h"
+#include <filesystem>
+#include <windows.h>
+
+namespace
+{
+    std::filesystem::path GetExeDirectory()
+    {
+        wchar_t path[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        return std::filesystem::path(path).parent_path();
+    }
+
+    std::wstring ResolveShaderFile(const std::wstring& filename)
+    {
+        std::filesystem::path original(filename);
+        if (std::filesystem::exists(original))
+            return original.wstring();
+
+        std::filesystem::path cwd = std::filesystem::current_path();
+        std::filesystem::path exeDir = GetExeDirectory();
+        std::filesystem::path name = original.filename();
+
+        std::vector<std::filesystem::path> candidates =
+        {
+            cwd / name,
+            cwd / "Project1" / name,
+            cwd / ".." / "Project1" / name,
+            exeDir / name,
+            exeDir / ".." / name,
+            exeDir / ".." / ".." / name,
+            exeDir / ".." / "Project1" / name,
+            exeDir / ".." / ".." / "Project1" / name
+        };
+
+        for (const auto& candidate : candidates)
+        {
+            if (std::filesystem::exists(candidate))
+                return candidate.lexically_normal().wstring();
+        }
+
+        return filename;
+    }
+}
 
 namespace d3dUtil
 {
@@ -17,8 +60,10 @@ namespace d3dUtil
         Microsoft::WRL::ComPtr<ID3DBlob> byteCode = nullptr;
         Microsoft::WRL::ComPtr<ID3DBlob> errors;
 
+        std::wstring resolvedFilename = ResolveShaderFile(filename);
+
         HRESULT hr = D3DCompileFromFile(
-            filename.c_str(),
+            resolvedFilename.c_str(),
             defines,
             D3D_COMPILE_STANDARD_FILE_INCLUDE,
             entrypoint.c_str(),

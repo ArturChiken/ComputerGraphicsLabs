@@ -2,6 +2,7 @@
 #include <windows.h>
 #include "Window.h"
 #include "DirectXApp.h"
+#include <exception>
 
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 
@@ -9,29 +10,41 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
     _In_ LPSTR lpCmdLine,
     _In_ int nCmdShow) {
-    
-    (void)hPrevInstance;
-    (void)lpCmdLine;
+    try
+    {
+        (void)hPrevInstance;
+        (void)lpCmdLine;
 
-    // 1. Создаем окно
-    Window window(hInstance, nCmdShow);
-    if (!window.Initialize(L"DirectX 12 Lab", 800, 600)) {
-        MessageBox(NULL, L"Failed to create window", L"Error", MB_OK);
+        // 1. Создаем окно
+        Window window(hInstance, nCmdShow);
+        if (!window.Initialize(L"DirectX 12 Lab", 800, 600)) {
+            MessageBox(NULL, L"Failed to create window", L"Error", MB_OK);
+            return 1;
+        }
+
+        // 2. Создаем DirectX приложение
+        DirectXApp dxApp(window);
+
+        // 3. Связываем окно и DirectXApp (для обработки сообщений)
+        window.SetDirectXApp(&dxApp);
+
+        // 4. Инициализируем DirectX
+        if (!dxApp.InitializeApp()) {
+            MessageBox(NULL, L"DirectX initialization failed", L"Error", MB_OK);
+            return 1;
+        }
+
+        // 5. Запускаем главный цикл приложения
+        return dxApp.Run();
+    }
+    catch (const std::exception& e)
+    {
+        MessageBoxA(NULL, e.what(), "Unhandled exception", MB_OK | MB_ICONERROR);
         return 1;
     }
-
-    // 2. Создаем DirectX приложение
-    DirectXApp dxApp(window);
-
-    // 3. Связываем окно и DirectXApp (для обработки сообщений)
-    window.SetDirectXApp(&dxApp);
-
-    // 4. Инициализируем DirectX
-    if (!dxApp.InitializeApp()) {
-        MessageBox(NULL, L"DirectX initialization failed", L"Error", MB_OK);
+    catch (...)
+    {
+        MessageBox(NULL, L"Unknown unhandled exception", L"Unhandled exception", MB_OK | MB_ICONERROR);
         return 1;
     }
-
-    // 5. Запускаем главный цикл приложения
-    return dxApp.Run();
 }
