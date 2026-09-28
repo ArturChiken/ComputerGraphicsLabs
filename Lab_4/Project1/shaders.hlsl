@@ -5,6 +5,8 @@ Texture2D gAlbedoBuffer : register(t0);
 Texture2D gNormalBuffer : register(t1);
 Texture2D gDepthBuffer : register(t2);
 Texture2D gLightingBuffer : register(t0);
+Texture2DArray<float> gShadowMaps : register(t3);
+SamplerComparisonState gShadowSampler : register(s1);
 
 SamplerState gSampler : register(s0);
 
@@ -46,6 +48,11 @@ cbuffer cbFrame : register(b0)
     float4 gScreenSize;
     DirectionalLightGpu gDirectionalLights[1];
     SpotLightGpu gSpotLights[2];
+    float4x4 gView;
+    float4x4 gShadowViewProjection[4];
+    float4 gCascadeSplits;
+    float4 gShadowParams; // enabled, PCF radius, inverse map resolution, debug cascades
+    float4 gShadowConfig; // near plane, blend fraction, receiver bias, distance fade start
 };
 
 cbuffer cbPointLight : register(b1)
@@ -171,7 +178,8 @@ HSConstantData GeometryPatchConstants(InputPatch<GeometryPSInput, 3> patch, uint
     float3 patchNormal = normalize(patch[0].NormalW + patch[1].NormalW + patch[2].NormalW);
     float3 toEye = normalize(eyePosAndDisplacementScale.xyz - center);
 
-    // A zero tessellation factor rejects a patch before the expensive domain shader.
+    // Camera backface rejection is invalid for shadow casters on the far side.
+#ifndef SHADOW_PASS
     if (dot(patchNormal, toEye) < -0.25f)
     {
         output.Edges[0] = 0.0f;
@@ -180,6 +188,7 @@ HSConstantData GeometryPatchConstants(InputPatch<GeometryPSInput, 3> patch, uint
         output.Inside = 0.0f;
         return output;
     }
+#endif
 
     // Shared edge midpoints produce the same factor in both neighboring patches.
     output.Edges[0] = TessFactorForPoint(0.5f * (patch[1].PosH.xyz + patch[2].PosH.xyz));
@@ -224,12 +233,84 @@ GeometryPSInput GeometryDS(
     displacement *= eyePosAndDisplacementScale.w;
     posW += normalW * displacement;
 
+#ifdef CACHE_TESSELLATION
+    // Stream output stores world space, independent of the current camera/cascade.
+    output.PosH = float4(posW, 1.0f);
+#else
     output.PosH = mul(float4(posW, 1.0f), mWorldViewProj);
+#endif
     output.NormalW = normalW;
     output.TangentW = tangentW;
     output.BitangentW = bitangentW;
     output.TexC = uv;
     output.TessFactor = input.Inside;
+    return output;
+}
+
+struct CachedVertexInput
+{
+    float4 PositionW : POSITION;
+    float3 NormalW : NORMAL;
+    float3 TangentW : TANGENT;
+    float3 BitangentW : BINORMAL;
+    float2 TexC : TEXCOORD;
+    float TessFactor : TEXCOORD1;
+};
+
+GeometryPSInput CachedGeometryVS(CachedVertexInput vin)
+{
+    GeometryPSInput output;
+    output.PosH = mul(vin.PositionW, mWorldViewProj);
+    output.NormalW = vin.NormalW;
+    output.TangentW = vin.TangentW;
+    output.BitangentW = vin.BitangentW;
+    output.TexC = vin.TexC;
+    output.TessFactor = vin.TessFactor;
+    return output;
+}
+
+struct CullingLineInput
+{
+    float3 Position : POSITION;
+    float3 Color : COLOR;
+};
+
+struct CullingLineOutput
+{
+    float4 Position : SV_POSITION;
+    float3 Color : COLOR;
+};
+
+CullingLineOutput CullingLineVS(CullingLineInput vin)
+{
+    CullingLineOutput output;
+    output.Position = mul(float4(vin.Position, 1), mWorldViewProj);
+    output.Color = vin.Color;
+    return output;
+}
+
+float4 CullingLinePS(CullingLineOutput pin) : SV_Target
+{
+    return float4(pin.Color, 1);
+}
+
+float4 CullingObserverPS(GeometryPSInput pin) : SV_Target
+{
+    float lighting = 0.4f + 0.6f * saturate(dot(normalize(pin.NormalW), normalize(float3(-1, 2, -1))));
+    return float4(float3(0.15f, 0.9f, 0.45f) * lighting, 1);
+}
+
+void ShadowPS(GeometryPSInput pin)
+{
+    clip(gDiffuseMap.Sample(gSampler, pin.TexC * uvTiling + uvOffset).a - 0.1f);
+}
+
+GeometryPSOutput GroundPS(GeometryPSInput pin)
+{
+    GeometryPSOutput output;
+    float checker = frac((floor(pin.TexC.x * 0.5) + floor(pin.TexC.y * 0.5)) * 0.5) * 2;
+    output.Albedo = float4(lerp(float3(0.25, 0.29, 0.31), float3(0.35, 0.39, 0.4), checker), 1);
+    output.Normal = float4(0, 1, 0, 1);
     return output;
 }
 
@@ -385,20 +466,31 @@ float3 ComputeSpotLights(float3 normal, float3 viewDir, float3 albedo, float3 wo
     return color;
 }
 
+#include "shadow_sampling.hlsli"
+
 float4 LightingPS(FullscreenPSInput pin) : SV_Target
 {
     float2 uv = pin.TexC;
     float4 albedoSample = gAlbedoBuffer.Sample(gSampler, uv);
     float3 normal = normalize(gNormalBuffer.Sample(gSampler, uv).xyz);
     float depth = gDepthBuffer.Sample(gSampler, uv).r;
+    if (depth >= 1.0f) return float4(0, 0, 0, 1);
 
     float3 worldPos = ReconstructWorldPosition(uv, depth);
     float3 viewDir = normalize(gCameraPosition.xyz - worldPos);
     float3 albedo = albedoSample.rgb;
 
     float3 color = albedo * float3(0.18f, 0.19f, 0.20f);
-    color += ComputeDirectionalLight(normal, viewDir, albedo, worldPos);
+    color += ComputeDirectionalLight(normal, viewDir, albedo, worldPos) * DirectionalShadow(worldPos, normal);
     color += ComputeSpotLights(normal, viewDir, albedo, worldPos);
+
+    if (gShadowParams.w > 0.5)
+    {
+        const float3 colors[4] = { float3(1,0.2,0.2), float3(0.2,1,0.3), float3(0.2,0.5,1), float3(1,0.8,0.15) };
+        float viewDepth = mul(float4(worldPos, 1), gView).z;
+        if (viewDepth <= gCascadeSplits.w)
+            color = lerp(color, colors[SelectCascade(viewDepth)], 0.45);
+    }
 
     return float4(color, 1.0f);
 }

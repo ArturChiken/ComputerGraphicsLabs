@@ -12,6 +12,8 @@
 #include "Submesh.h"
 #include "CullingScene.h"
 #include "ParticleSystem.h"
+#include "ShadowCascades.h"
+#include "Vertex.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -65,8 +67,22 @@ struct SceneRenderContext
     UINT DebugViewMode = 1;
     CullingMode Culling = CullingMode::Octree;
     bool ShowCullingScene = true;
+    bool ObserveCulling = false;
+    bool ShowCulledBounds = true;
     ParticleSettings Particles;
     float DeltaTime = 0.0f;
+    ShadowSettings Shadows;
+    DirectX::BoundingBox SceneBounds;
+    bool CacheTessellation = true;
+};
+
+struct TessellationCacheStats
+{
+    UINT64 Updates = 0;
+    UINT64 ReusedFrames = 0;
+    UINT64 Triangles = 0;
+    UINT ReadyMeshes = 0;
+    UINT FallbackMeshes = 0;
 };
 
 class GBuffer
@@ -110,13 +126,18 @@ private:
 
 class RenderingSystem
 {
+    friend struct ShadowTestAccess;
 public:
     const CullingStats& GetCullingStats() const { return mCullingScene.Stats; }
     UINT GetParticleCount() const { return mParticles.AliveCount(); }
     void ResetParticles() { mParticles.RequestReset(); }
-    void OnFrameComplete() { mParticles.ReadCompletedCount(); }
+    // Call only after the frame fence has completed.
+    void OnFrameComplete();
+    const TessellationCacheStats& GetTessellationCacheStats() const { return mTessStats; }
+    static constexpr float TessellationUpdateInterval = 0.2f;
     size_t GetOctreeNodeCount() const { return mCullingScene.NodeCount(); }
     size_t GetSceneObjectCount() const { return mCullingScene.Objects.size(); }
+    const std::array<float, 4>& GetCascadeSplits() const { return mCascades.Splits; }
     bool Initialize(
         ID3D12Device* device,
         UINT width,
@@ -132,14 +153,68 @@ public:
         const SceneRenderContext& scene);
 
 private:
+    static constexpr UINT CachedVertexStride = 64;
+    static constexpr UINT64 TessellationCacheBudget = 512ull * 1024 * 1024;
+    struct TessellationMesh
+    {
+        ComPtr<ID3D12Resource> Active, Scratch, Counter;
+        UINT64 ActiveBytes = 0, ScratchBytes = 0, RequiredBytes = 0;
+        UINT VertexCount = 0;
+        bool Pending = false, Captured = false;
+        float Age = TessellationUpdateInterval;
+        UINT64 LastUpdateFrame = 0;
+        ObjectConstants LastConstants = {};
+        ID3D12Resource* HeightMap = nullptr;
+        UINT IndexStart = 0, IndexCount = 0;
+    };
+    std::vector<TessellationMesh> mTessMeshes;
+    TessellationCacheStats mTessStats;
+    UINT64 mTessFrame = 0;
+    D3D12_VERTEX_BUFFER_VIEW mTessSourceVb = {};
+    D3D12_INDEX_BUFFER_VIEW mTessSourceIb = {};
+    ComPtr<ID3D12QueryHeap> mTessQueries;
+    ComPtr<ID3D12Resource> mTessReadback;
+    std::unique_ptr<UploadBuffer<UINT64>> mTessZero;
+    ComPtr<ID3DBlob> mCacheDs, mCachedVs;
+    ComPtr<ID3D12PipelineState> mCaptureTessPso, mCachedPso, mCachedWirePso, mCachedShadowPso;
+    void UpdateTessellationCache(ID3D12GraphicsCommandList* commands, const SceneRenderContext& scene);
+    void ReadCompletedTessellation();
     CullingScene mCullingScene;
+    DirectX::BoundingFrustum mCullingFrustum;
     ParticleSystem mParticles;
+    ShadowCascades mCascades;
+    ComPtr<ID3D12Resource> mShadowMap;
+    ComPtr<ID3D12DescriptorHeap> mShadowDsvHeap;
+    ComPtr<ID3D12PipelineState> mShadowPso, mShadowNoTessPso, mShadowInstancePso, mGroundPso;
+    ComPtr<ID3DBlob> mShadowHs, mShadowPs, mGroundPs;
+    std::unique_ptr<UploadBuffer<ObjectConstants>> mDrawConstants;
+    std::unique_ptr<UploadBuffer<InstanceData>> mShadowInstances;
+    std::unique_ptr<UploadBuffer<Vertex>> mGroundVertices;
+    UINT mObjectSlots = 0;
+    UINT mShadowInstanceCapacity = 0;
+    void BuildShadowResources();
+    void RenderShadows(ID3D12GraphicsCommandList* commands, const SceneRenderContext& scene);
+    void RenderModels(ID3D12GraphicsCommandList* commands, const SceneRenderContext& scene,
+        const DirectX::XMFLOAT4X4& viewProjection, bool shadow, UINT constantBase);
+    void BindObjectConstants(ID3D12GraphicsCommandList* commands, UINT slot, const ObjectConstants& constants);
+    void RenderGround(ID3D12GraphicsCommandList* commands, const SceneRenderContext& scene);
     std::unique_ptr<UploadBuffer<InstanceData>> mInstanceBuffer;
     UINT mInstanceCapacity = 0;
     ComPtr<ID3DBlob> mInstanceVs;
     ComPtr<ID3D12PipelineState> mInstancePso;
     ComPtr<ID3D12PipelineState> mInstanceWireframePso;
     void RenderInstances(ID3D12GraphicsCommandList* commandList, const SceneRenderContext& scene);
+    void RenderCullingObserver(ID3D12GraphicsCommandList* commands,
+        D3D12_CPU_DESCRIPTOR_HANDLE target, const SceneRenderContext& scene);
+    struct DebugLineVertex
+    {
+        DirectX::XMFLOAT3 Position;
+        DirectX::XMFLOAT3 Color;
+    };
+    ComPtr<ID3DBlob> mCullingLineVs, mCullingLinePs, mCullingObserverPs;
+    ComPtr<ID3D12PipelineState> mCullingLinePso, mCullingObserverPso;
+    std::unique_ptr<UploadBuffer<DebugLineVertex>> mCullingLines;
+    UINT mCullingLineCapacity = 0;
     static constexpr UINT MaxDirectionalLights = 1;
     static constexpr UINT MaxSpotLights = 2;
     static constexpr UINT MaxPointLightVolumes = 512;
@@ -172,6 +247,11 @@ private:
         DirectX::XMFLOAT4 ScreenSize;
         DirectionalLightGpu DirectionalLights[MaxDirectionalLights];
         SpotLightGpu SpotLights[MaxSpotLights];
+        DirectX::XMFLOAT4X4 View;
+        DirectX::XMFLOAT4X4 ShadowViewProjection[4];
+        DirectX::XMFLOAT4 CascadeSplits;
+        DirectX::XMFLOAT4 ShadowParams;
+        DirectX::XMFLOAT4 ShadowConfig;
     };
 
     struct PointLightVolumeConstants

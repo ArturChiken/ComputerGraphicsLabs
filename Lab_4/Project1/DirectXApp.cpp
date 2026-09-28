@@ -1258,6 +1258,33 @@ void DirectXApp::OnResize() {
 // Обработка клавиатуры
 void DirectXApp::OnKeyDown(WPARAM wParam)
 {
+    if (wParam == VK_F10 && !mF10KeyDown)
+    {
+        mF10KeyDown = true;
+        mObserveCulling = !mObserveCulling;
+        if (mObserveCulling) mShowCullingScene = true;
+    }
+    if (wParam == VK_F11 && !mF11KeyDown)
+    {
+        mF11KeyDown = true;
+        mShowCulledBounds = !mShowCulledBounds;
+    }
+    if (wParam == 'T' && !mTessellationKeyDown)
+    {
+        mTessellationKeyDown = true;
+        mTessellationCacheEnabled = !mTessellationCacheEnabled;
+    }
+    const WPARAM shadowKeys[] = { 'J', 'K', 'L', 'G', 'U' };
+    for (UINT i = 0; i < _countof(shadowKeys); ++i)
+    {
+        if (wParam != shadowKeys[i] || mShadowKeysDown[i]) continue;
+        mShadowKeysDown[i] = true;
+        if (i == 0) mShadowSettings.Enabled = !mShadowSettings.Enabled;
+        if (i == 1) mShadowSettings.PcfRadius = (mShadowSettings.PcfRadius + 1) % 3;
+        if (i == 2) mShadowSettings.ShowCascades = !mShadowSettings.ShowCascades;
+        if (i == 3) mShadowSettings.ShowGround = !mShadowSettings.ShowGround;
+        if (i == 4) mShadowSettings.SplitLambda = mShadowSettings.SplitLambda > 0 ? 0.0f : 0.7f;
+    }
     const WPARAM particleKeys[] = { VK_F8, VK_F9, 'E', 'R', VK_OEM_4, VK_OEM_6 };
     for (UINT i = 0; i < _countof(particleKeys); ++i)
     {
@@ -1277,6 +1304,7 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
     {
         mF7KeyDown = true;
         mShowCullingScene = !mShowCullingScene;
+        if (!mShowCullingScene) mObserveCulling = false;
     }
     // M toggles render mode; SPACE remains reserved for camera movement.
     if (wParam == 'M') {
@@ -1317,6 +1345,12 @@ void DirectXApp::OnKeyDown(WPARAM wParam)
 
 void DirectXApp::OnKeyUp(WPARAM wParam)
 {
+    if (wParam == VK_F10) mF10KeyDown = false;
+    if (wParam == VK_F11) mF11KeyDown = false;
+    if (wParam == 'T') mTessellationKeyDown = false;
+    const WPARAM shadowKeys[] = { 'J', 'K', 'L', 'G', 'U' };
+    for (UINT i = 0; i < _countof(shadowKeys); ++i)
+        if (wParam == shadowKeys[i]) mShadowKeysDown[i] = false;
     const WPARAM particleKeys[] = { VK_F8, VK_F9, 'E', 'R', VK_OEM_4, VK_OEM_6 };
     for (UINT i = 0; i < _countof(particleKeys); ++i)
         if (wParam == particleKeys[i]) mParticleKeysDown[i] = false;
@@ -1368,6 +1402,30 @@ void DirectXApp::CalculateFrameStats() {
         float mspf = 1000.0f / fps;
 
         std::wstring windowText = mMainWndCaption;
+        std::wstring tessStatus;
+        if (mRenderingSystem)
+        {
+            const auto& stats = mRenderingSystem->GetTessellationCacheStats();
+            tessStatus = mTessellationCacheEnabled ? L" | Tess cache" : L" | Tess EVERY FRAME";
+            if (mTessellationCacheEnabled)
+                tessStatus += L" | Builds " + std::to_wstring(stats.Updates) + L" Reuse " +
+                    std::to_wstring(stats.ReusedFrames) + L" Tris " + std::to_wstring(stats.Triangles) +
+                    (stats.FallbackMeshes ? L" | Fallback " + std::to_wstring(stats.FallbackMeshes) : L"");
+        }
+        if (!mShowCullingScene && !mParticleSettings.Visible && mRenderingSystem)
+        {
+            std::wostringstream title;
+            title << tessStatus.substr(3) << L" | HW6 CSM " << (mShadowSettings.Enabled ? L"ON" : L"OFF")
+                << L" | PCF " << (mShadowSettings.PcfRadius * 2 + 1)
+                << L" | Lambda " << std::fixed << std::setprecision(1) << mShadowSettings.SplitLambda
+                << L" | Splits";
+            for (float split : mRenderingSystem->GetCascadeSplits()) title << L" " << split;
+            title << L" | " << int(fps) << L" FPS";
+            SetWindowText(window.GetHandle(), title.str().c_str());
+            mFrameCount = 0;
+            mTimeElapsed += 1.0f;
+            return;
+        }
         if (!mShowCullingScene && mParticleSettings.Visible && mRenderingSystem)
         {
             std::wostringstream title;
@@ -1375,7 +1433,7 @@ void DirectXApp::CalculateFrameStats() {
                 << L" | Emit " << static_cast<int>(mParticleSettings.EmissionRate) << L"/s"
                 << (mParticleSettings.Emit ? L" ON" : L" OFF")
                 << (mParticleSettings.Paused ? L" | PAUSED" : L" | RUNNING")
-                << L" | " << static_cast<int>(fps) << L" FPS | Speed " << std::fixed << std::setprecision(2) << mCameraSpeed;
+                << L" | " << static_cast<int>(fps) << L" FPS | Speed " << std::fixed << std::setprecision(2) << mCameraSpeed << tessStatus;
             SetWindowText(window.GetHandle(), title.str().c_str());
             mFrameCount = 0;
             mTimeElapsed += 1.0f;
@@ -1387,10 +1445,12 @@ void DirectXApp::CalculateFrameStats() {
             const wchar_t* mode = mCullingMode == CullingMode::None ? L"Off" :
                 (mCullingMode == CullingMode::Linear ? L"Linear" : L"Octree");
             std::wostringstream title;
-            title << L"HW4 " << mode << L" | Drawn " << stats.Visible
+            title << L"HW4 " << (mObserveCulling ? L"SIDE | " : L"CAMERA | ") << mode << L" | Drawn " << stats.Visible
                 << L"/" << mRenderingSystem->GetSceneObjectCount() << L" | Tests " << stats.ObjectTests << L"+" << stats.NodeTests
                 << L" | " << std::fixed << std::setprecision(2) << stats.Milliseconds
                 << L" ms | " << static_cast<int>(fps) << L" FPS | Speed " << mCameraSpeed;
+            if (mObserveCulling) title << (mShowCulledBounds ? L" | Culled bounds ON" : L" | Culled bounds OFF");
+            else title << tessStatus;
             SetWindowText(window.GetHandle(), title.str().c_str());
             mFrameCount = 0;
             mTimeElapsed += 1.0f;
@@ -1425,6 +1485,7 @@ void DirectXApp::CalculateFrameStats() {
         windowText += L" Tess: " + std::to_wstring(tessFactor);
         windowText += L" (F1 default, F2 normals, F3 tessellation, M wireframe)";
 
+        windowText += tessStatus;
         SetWindowText(window.GetHandle(), windowText.c_str());
 
         mFrameCount = 0;
@@ -1726,8 +1787,13 @@ void DirectXApp::Draw(const Timer& gt)
     scene.DebugViewMode = static_cast<UINT>(mDebugViewMode);
     scene.Culling = mCullingMode;
     scene.ShowCullingScene = mShowCullingScene;
+    scene.ObserveCulling = mObserveCulling;
+    scene.ShowCulledBounds = mShowCulledBounds;
     scene.Particles = mParticleSettings;
     scene.DeltaTime = gt.DeltaTime();
+    scene.Shadows = mShadowSettings;
+    scene.CacheTessellation = mTessellationCacheEnabled;
+    scene.SceneBounds = BoundingBox(mSceneCenter, XMFLOAT3(mSceneExtent.x * 0.5f, mSceneExtent.y * 0.5f, mSceneExtent.z * 0.5f));
 
     mRenderingSystem->Render(
         mCommandList.Get(),

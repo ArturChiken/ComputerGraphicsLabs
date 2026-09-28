@@ -204,6 +204,7 @@ void ParticleSystem::Simulate(ID3D12GraphicsCommandList* commands, float dt,
         Transition(commands, mDrawArguments.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
         mReset = false;
     }
+    
     if (settings.Emit)
     {
         mEmissionRemainder += (std::clamp)(settings.EmissionRate, 0.0f, 30000.0f) * dt;

@@ -163,6 +163,17 @@ LRESULT CALLBACK Window::WindowProc(HWND hWnd, UINT message,
         }
         break;
 
+    case WM_SYSKEYDOWN:
+    case WM_SYSKEYUP:
+        // F10 normally activates the window menu; reserve bare F10 for the observer.
+        // Other system shortcuts, including Alt+F4, still go to DefWindowProc.
+        if (wParam == VK_F10 && (lParam & (1LL << 29)) == 0 && window && window->GetDirectXApp()) {
+            if (message == WM_SYSKEYDOWN) window->GetDirectXApp()->OnKeyDown(wParam);
+            else window->GetDirectXApp()->OnKeyUp(wParam);
+            return 0;
+        }
+        break;
+
     case WM_KEYDOWN:
         if (window && window->GetDirectXApp()) {
             window->GetDirectXApp()->OnKeyDown(wParam);
@@ -171,12 +182,14 @@ LRESULT CALLBACK Window::WindowProc(HWND hWnd, UINT message,
             DestroyWindow(hWnd);
             return 0;
         }
+        if (wParam == VK_F10) return 0;
         break;
 
     case WM_KEYUP:
         if (window && window->GetDirectXApp()) {
             window->GetDirectXApp()->OnKeyUp(wParam);
         }
+        if (wParam == VK_F10) return 0;
         break;
     }
 

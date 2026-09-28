@@ -203,8 +203,16 @@ private:
     CullingMode mCullingMode = CullingMode::Octree;
     bool mShowCullingScene = false;
     bool mF7KeyDown = false;
-    ParticleSettings mParticleSettings;
+    bool mObserveCulling = false;
+    bool mShowCulledBounds = true;
+    bool mF10KeyDown = false;
+    bool mF11KeyDown = false;
+    bool mTessellationCacheEnabled = true;
+    bool mTessellationKeyDown = false;
+    ParticleSettings mParticleSettings = [] { ParticleSettings p; p.Visible = false; return p; }();
     bool mParticleKeysDown[6] = {};
+    ShadowSettings mShadowSettings;
+    bool mShadowKeysDown[5] = {};
 
     // Математика для камеры
     float mTheta = 1.5f * XM_PI;
